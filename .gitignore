@@ -1,0 +1,30 @@
+# Reference repo and large external assets
+TRACE-master/
+dataset/
+qvhighlights/
+
+# Python caches and environments
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+
+# Local agent/editor state
+.agents/
+.codex/
+.idea/
+.vscode/
+
+# TinyTrace generated artifacts
+TinyTrace/.venv/
+TinyTrace/outputs*/
+TinyTrace/**/*.pt
+TinyTrace/**/*.log
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,12 @@
+{
+  "image_size": 96,
+  "patch_size": 16,
+  "max_frames": 8,
+  "visual_hidden_dim": 128,
+  "compressed_visual_tokens": 4,
+  "d_model": 192,
+  "num_layers": 4,
+  "num_heads": 6,
+  "max_events": 3,
+  "max_generated_tokens": 96
+}

@@ -1,0 +1,184 @@
+[
+  {
+    "source_id": 4943,
+    "video_path": "qvhighlights/videos/train/yXR17NNJgdU_60.0_210.0.mp4",
+    "instruction": "localize highlight events and describe them",
+    "events": [
+      {
+        "timestamp": [
+          82.0,
+          83.5
+        ],
+        "score": [
+          3.7
+        ],
+        "caption": "Woman in red top monologues with with white pillows on the couch behind her."
+      },
+      {
+        "timestamp": [
+          108.0,
+          111.5
+        ],
+        "score": [
+          3.7
+        ],
+        "caption": "Woman in red top monologues with with white pillows on the couch behind her."
+      }
+    ]
+  },
+  {
+    "source_id": 147,
+    "video_path": "qvhighlights/videos/train/9JtIsmHSuH4_360.0_510.0.mp4",
+    "instruction": "localize highlight events and describe them",
+    "events": [
+      {
+        "timestamp": [
+          72.0,
+          97.5
+        ],
+        "score": [
+          3.7
+        ],
+        "caption": "Two women walk down the hallway together."
+      }
+    ]
+  },
+  {
+    "source_id": 782,
+    "video_path": "qvhighlights/videos/train/CR1fubD0GuM_210.0_360.0.mp4",
+    "instruction": "localize highlight events and describe them",
+    "events": [
+      {
+        "timestamp": [
+          90.0,
+          91.5
+        ],
+        "score": [
+          3.7
+        ],
+        "caption": "An interface for finding music been explained by an Indian man"
+      },
+      {
+        "timestamp": [
+          96.0,
+          97.5
+        ],
+        "score": [
+          3.7
+        ],
+        "caption": "An interface for finding music been explained by an Indian man"
+      }
+    ]
+  },
+  {
+    "source_id": 5296,
+    "video_path": "qvhighlights/videos/train/351G5E5XWXw_210.0_360.0.mp4",
+    "instruction": "localize highlight events and describe them",
+    "events": [
+      {
+        "timestamp": [
+          104.0,
+          104.0
+        ],
+        "score": [
+          3.3
+        ],
+        "caption": "The man goes through the drive thru at McDonalds and orders some food."
+      },
+      {
+        "timestamp": [
+          104.5,
+          104.5
+        ],
+        "score": [
+          3.3
+        ],
+        "caption": "The man goes through the drive thru at McDonalds and orders some food."
+      },
+      {
+        "timestamp": [
+          105.0,
+          105.0
+        ],
+        "score": [
+          3.3
+        ],
+        "caption": "The man goes through the drive thru at McDonalds and orders some food."
+      }
+    ]
+  },
+  {
+    "source_id": 1327,
+    "video_path": "qvhighlights/videos/train/0gzFURbCXoE_510.0_660.0.mp4",
+    "instruction": "localize highlight events and describe them",
+    "events": [
+      {
+        "timestamp": [
+          0.0,
+          0.0
+        ],
+        "score": [
+          3.3
+        ],
+        "caption": "Blonde woman in white top has her hair in pig tails."
+      },
+      {
+        "timestamp": [
+          0.5,
+          0.5
+        ],
+        "score": [
+          3.3
+        ],
+        "caption": "Blonde woman in white top has her hair in pig tails."
+      },
+      {
+        "timestamp": [
+          1.0,
+          1.0
+        ],
+        "score": [
+          3.3
+        ],
+        "caption": "Blonde woman in white top has her hair in pig tails."
+      }
+    ]
+  },
+  {
+    "source_id": 4246,
+    "video_path": "qvhighlights/videos/train/FyIb82iLqQA_210.0_360.0.mp4",
+    "instruction": "localize highlight events and describe them",
+    "events": [
+      {
+        "timestamp": [
+          94.0,
+          94.0
+        ],
+        "score": [
+          3.3
+        ],
+        "caption": "Man in white top speaks in front of a blue background."
+      },
+      {
+        "timestamp": [
+          94.5,
+          94.5
+        ],
+        "score": [
+          3.3
+        ],
+        "caption": "Man in white top speaks in front of a blue background."
+      },
+      {
+        "timestamp": [
+          95.0,
+          95.0
+        ],
+        "score": [
+          3.3
+        ],
+        "caption": "Man in white top speaks in front of a blue background."
+      }
+    ]
+  }
+]
