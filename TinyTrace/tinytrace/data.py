@@ -179,8 +179,8 @@ class JsonTinyTraceDataset(Dataset):
             "rgb24",
             "-vcodec",
             "rawvideo",
-            "-s",
-            f"{size}x{size}",
+            "-vf",
+            f"scale={size}:{size}:force_original_aspect_ratio=increase,crop={size}:{size}",
             "-",
         ]
         expected = size * size * 3
@@ -236,8 +236,12 @@ class JsonTinyTraceDataset(Dataset):
 
 def tinytrace_collate_fn(batch: list[dict]) -> dict:
     max_seq = max(sample["token_ids"].size(0) for sample in batch)
+    max_frames = max(sample["frames"].size(0) for sample in batch)
     padded_tokens = []
     padded_types = []
+    padded_frames = []
+    padded_frame_times = []
+    frame_masks = []
 
     for sample in batch:
         pad_len = max_seq - sample["token_ids"].size(0)
@@ -254,9 +258,38 @@ def tinytrace_collate_fn(batch: list[dict]) -> dict:
             )
         )
 
+        frame_count = sample["frames"].size(0)
+        frame_pad = max_frames - frame_count
+        padded_frames.append(
+            torch.cat(
+                [
+                    sample["frames"],
+                    torch.zeros(
+                        frame_pad,
+                        *sample["frames"].shape[1:],
+                        dtype=sample["frames"].dtype,
+                    ),
+                ],
+                dim=0,
+            )
+        )
+        padded_frame_times.append(
+            torch.cat(
+                [sample["frame_times"], torch.zeros(frame_pad, dtype=sample["frame_times"].dtype)],
+                dim=0,
+            )
+        )
+        frame_masks.append(
+            torch.cat(
+                [torch.ones(frame_count, dtype=torch.bool), torch.zeros(frame_pad, dtype=torch.bool)],
+                dim=0,
+            )
+        )
+
     return {
-        "frames": torch.stack([sample["frames"] for sample in batch], dim=0),
-        "frame_times": torch.stack([sample["frame_times"] for sample in batch], dim=0),
+        "frames": torch.stack(padded_frames, dim=0),
+        "frame_times": torch.stack(padded_frame_times, dim=0),
+        "frame_mask": torch.stack(frame_masks, dim=0),
         "token_ids": torch.stack(padded_tokens, dim=0),
         "label_types": torch.stack(padded_types, dim=0),
         "events": [sample["events"] for sample in batch],

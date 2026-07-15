@@ -1,2 +1,4 @@
 torch
 torchvision
+numpy
+mobileclip @ git+https://github.com/apple/ml-mobileclip.git

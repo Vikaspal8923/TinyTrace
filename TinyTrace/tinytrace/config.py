@@ -1,14 +1,20 @@
-from dataclasses import dataclass, field
+import json
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
 
 
 @dataclass
 class TinyTraceConfig:
-    image_size: int = 96
-    patch_size: int = 16
+    image_size: int = 256
     max_frames: int = 8
-    visual_hidden_dim: int = 128
+    visual_hidden_dim: int = 1024
     compressed_visual_tokens: int = 4
     time_tokens_per_frame: int = 6
+
+    mobileclip_model_name: str = "mobileclip_s0"
+    mobileclip_checkpoint: str = "checkpoints/mobileclip_s0.pt"
+    freeze_visual_encoder: bool = True
 
     d_model: int = 192
     num_layers: int = 4
@@ -57,3 +63,23 @@ class TinyTraceConfig:
     @property
     def total_token_vocab(self) -> int:
         return self.score_token_base + len(self.score_vocab)
+
+    @classmethod
+    def from_dict(cls, values: dict[str, Any]) -> "TinyTraceConfig":
+        known_fields = cls.__dataclass_fields__
+        unknown = sorted(set(values) - set(known_fields))
+        if unknown:
+            raise ValueError(f"Unknown TinyTrace config fields: {', '.join(unknown)}")
+
+        normalized = dict(values)
+        for field_name in ("time_vocab", "score_vocab"):
+            if field_name in normalized:
+                normalized[field_name] = tuple(normalized[field_name])
+        return cls(**normalized)
+
+    @classmethod
+    def from_json(cls, path: str | Path) -> "TinyTraceConfig":
+        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)

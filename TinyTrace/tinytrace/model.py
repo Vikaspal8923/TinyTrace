@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import TinyTraceConfig
+from .vision import MobileCLIPSpatialEncoder, SlotCompressor
 
 
 class PositionalEncoding(nn.Module):
@@ -25,39 +26,31 @@ class PositionalEncoding(nn.Module):
 
 
 class LightweightVisualEncoder(nn.Module):
-    def __init__(self, config: TinyTraceConfig) -> None:
+    def __init__(
+        self,
+        config: TinyTraceConfig,
+        mobileclip_backbone: nn.Module | None = None,
+        load_pretrained_visual: bool = True,
+    ) -> None:
         super().__init__()
-        self.patch_embed = nn.Conv2d(3, config.visual_hidden_dim, kernel_size=config.patch_size, stride=config.patch_size)
-        self.frame_projector = nn.Sequential(
-            nn.Linear(config.visual_hidden_dim, config.d_model),
-            nn.GELU(),
-            nn.Linear(config.d_model, config.d_model),
+        self.mobileclip = MobileCLIPSpatialEncoder(
+            config,
+            backbone=mobileclip_backbone,
+            load_pretrained=load_pretrained_visual,
         )
-        self.compression_queries = nn.Parameter(torch.randn(config.compressed_visual_tokens, config.visual_hidden_dim))
-        self.time_mlp = nn.Sequential(
-            nn.Linear(1, config.d_model),
-            nn.GELU(),
-            nn.Linear(config.d_model, config.d_model),
+        self.compressor = SlotCompressor(
+            input_dim=config.visual_hidden_dim,
+            output_dim=config.d_model,
+            num_slots=config.compressed_visual_tokens,
         )
         self.config = config
 
-    def forward(self, frames: torch.Tensor, frame_times: torch.Tensor) -> torch.Tensor:
+    def forward(self, frames: torch.Tensor) -> torch.Tensor:
         batch, num_frames, channels, height, width = frames.shape
-        patches = self.patch_embed(frames.view(batch * num_frames, channels, height, width))
-        patches = patches.flatten(2).transpose(1, 2)
-        patches = patches.view(batch, num_frames, patches.size(1), patches.size(2))
-
-        queries = self.compression_queries.unsqueeze(0).unsqueeze(0).expand(batch, num_frames, -1, -1)
-        scores = torch.matmul(queries, patches.transpose(-1, -2)) / math.sqrt(patches.size(-1))
-        weights = torch.softmax(scores, dim=-1)
-        compressed = torch.matmul(weights, patches)
-        compressed = self.frame_projector(compressed)
-
-        frame_times = frame_times.unsqueeze(-1)
-        time_features = self.time_mlp(frame_times).unsqueeze(2)
-
-        visual_tokens = torch.cat([compressed, time_features], dim=2)
-        return visual_tokens.view(batch, -1, visual_tokens.size(-1))
+        patches = self.mobileclip(frames.reshape(batch * num_frames, channels, height, width))
+        compressed = self.compressor(patches)
+        compressed = compressed.view(batch, num_frames, self.config.compressed_visual_tokens, -1)
+        return compressed
 
 
 class DecoderBlock(nn.Module):
@@ -73,9 +66,21 @@ class DecoderBlock(nn.Module):
             nn.Linear(config.d_model * config.mlp_ratio, config.d_model),
         )
 
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: torch.Tensor,
+        key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         normed = self.ln1(x)
-        attn_out, _ = self.attn(normed, normed, normed, attn_mask=attn_mask, need_weights=False)
+        attn_out, _ = self.attn(
+            normed,
+            normed,
+            normed,
+            attn_mask=attn_mask,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
         x = x + attn_out
         x = x + self.mlp(self.ln2(x))
         return x
@@ -91,10 +96,19 @@ class TinyTraceOutput:
 
 
 class TinyTraceModel(nn.Module):
-    def __init__(self, config: TinyTraceConfig) -> None:
+    def __init__(
+        self,
+        config: TinyTraceConfig,
+        mobileclip_backbone: nn.Module | None = None,
+        load_pretrained_visual: bool = True,
+    ) -> None:
         super().__init__()
         self.config = config
-        self.visual_encoder = LightweightVisualEncoder(config)
+        self.visual_encoder = LightweightVisualEncoder(
+            config,
+            mobileclip_backbone=mobileclip_backbone,
+            load_pretrained_visual=load_pretrained_visual,
+        )
         self.text_embeddings = nn.Embedding(config.text_vocab_size, config.d_model)
         self.sync_embedding = nn.Parameter(torch.randn(config.d_model))
         self.time_embeddings = nn.Embedding(len(config.time_vocab), config.d_model)
@@ -107,6 +121,66 @@ class TinyTraceModel(nn.Module):
         self.text_head = nn.Linear(config.d_model, config.text_vocab_size + 1)
         self.time_head = nn.Linear(config.d_model, len(config.time_vocab))
         self.score_head = nn.Linear(config.d_model, len(config.score_vocab))
+
+    def _encode_frame_time_ids(self, frame_times: torch.Tensor) -> torch.Tensor:
+        if frame_times.ndim != 2:
+            raise ValueError("frame_times must have shape [batch, num_frames].")
+
+        token_to_id = {token: index for index, token in enumerate(self.config.time_vocab)}
+        rows: list[list[list[int]]] = []
+        for sample_times in frame_times.detach().cpu().tolist():
+            sample_rows = []
+            for value in sample_times:
+                formatted = format(float(value), "0>6.1f")
+                if len(formatted) != self.config.time_tokens_per_frame:
+                    raise ValueError(
+                        f"Frame timestamp {value} cannot be represented as a "
+                        f"{self.config.time_tokens_per_frame}-token TRACE timestamp."
+                    )
+                try:
+                    sample_rows.append([token_to_id[character] for character in formatted])
+                except KeyError as exc:
+                    raise ValueError(f"Unsupported character in frame timestamp {formatted!r}.") from exc
+            rows.append(sample_rows)
+        return torch.tensor(rows, dtype=torch.long, device=frame_times.device)
+
+    def build_visual_prefix(self, frames: torch.Tensor, frame_times: torch.Tensor) -> torch.Tensor:
+        visual_tokens = self.visual_encoder(frames)
+        if visual_tokens.shape[:2] != frame_times.shape:
+            raise ValueError(
+                "Frame/time shape mismatch: visual encoder produced "
+                f"{tuple(visual_tokens.shape[:2])}, frame_times has {tuple(frame_times.shape)}."
+            )
+
+        time_ids = self._encode_frame_time_ids(frame_times)
+        time_tokens = self.time_embeddings(time_ids)
+        per_frame_tokens = torch.cat([visual_tokens, time_tokens], dim=2)
+        return per_frame_tokens.flatten(1, 2)
+
+    def _build_key_padding_mask(
+        self,
+        token_ids: torch.Tensor,
+        frame_mask: torch.Tensor | None,
+        num_frames: int,
+    ) -> torch.Tensor | None:
+        if frame_mask is None:
+            frame_mask = torch.ones(
+                token_ids.size(0),
+                num_frames,
+                dtype=torch.bool,
+                device=token_ids.device,
+            )
+        if frame_mask.shape != (token_ids.size(0), num_frames):
+            raise ValueError(
+                f"frame_mask must have shape {(token_ids.size(0), num_frames)}, "
+                f"received {tuple(frame_mask.shape)}."
+            )
+
+        tokens_per_frame = self.config.compressed_visual_tokens + self.config.time_tokens_per_frame
+        visual_padding = (~frame_mask.bool()).repeat_interleave(tokens_per_frame, dim=1)
+        text_padding = token_ids.eq(self.config.pad_token_id)
+        combined = torch.cat([visual_padding, text_padding], dim=1)
+        return combined if combined.any() else None
 
     def _expected_phase_lengths(self) -> tuple[int, int]:
         time_len = (
@@ -163,16 +237,18 @@ class TinyTraceModel(nn.Module):
         token_ids: torch.Tensor,
         labels: torch.Tensor | None = None,
         label_types: torch.Tensor | None = None,
+        frame_mask: torch.Tensor | None = None,
     ) -> TinyTraceOutput:
-        visual_tokens = self.visual_encoder(frames, frame_times)
+        visual_tokens = self.build_visual_prefix(frames, frame_times)
         token_embeddings = self.embed_mixed_tokens(token_ids)
         x = torch.cat([visual_tokens, token_embeddings], dim=1)
         x = self.dropout(self.position(x))
 
         seq_len = x.size(1)
         attn_mask = torch.triu(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool), diagonal=1)
+        key_padding_mask = self._build_key_padding_mask(token_ids, frame_mask, frames.size(1))
         for block in self.blocks:
-            x = block(x, attn_mask)
+            x = block(x, attn_mask, key_padding_mask=key_padding_mask)
         x = self.final_norm(x)
 
         text_logits = self.text_head(x)
@@ -244,14 +320,20 @@ class TinyTraceModel(nn.Module):
         frame_times: torch.Tensor,
         prompt_ids: torch.Tensor,
         max_new_tokens: int,
+        frame_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if prompt_ids.size(0) != 1:
+            raise ValueError(
+                "TinyTrace generation currently supports batch size 1. "
+                "Per-sequence adaptive head state is not implemented yet."
+            )
         generated = prompt_ids.clone()
         mode = "time"
         phase_token_count = 0
         event_count = 0
         min_time_tokens, min_score_tokens = self._expected_phase_lengths()
         for _ in range(max_new_tokens):
-            output = self.forward(frames, frame_times, generated)
+            output = self.forward(frames, frame_times, generated, frame_mask=frame_mask)
             if mode == "time":
                 next_logits = output.time_logits[:, -1, :].clone()
             elif mode == "score":

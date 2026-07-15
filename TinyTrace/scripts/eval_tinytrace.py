@@ -21,9 +21,11 @@ def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
 
-    config = TinyTraceConfig()
-    model = TinyTraceModel(config).to(device)
     checkpoint = torch.load(args.checkpoint, map_location=device)
+    if "config" not in checkpoint:
+        raise ValueError("Checkpoint does not contain the TinyTrace configuration.")
+    config = TinyTraceConfig.from_dict(checkpoint["config"])
+    model = TinyTraceModel(config, load_pretrained_visual=False).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
 

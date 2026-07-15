@@ -18,14 +18,20 @@ while replacing the heavy backbone with a smaller visual encoder and a compact d
 
 ## Current Status
 
-TinyTrace is currently a working prototype:
+TinyTrace is currently an architecture-aligned prototype:
 
-- synthetic-data training works
-- real-video loading works
-- small real-data QVHighlights subset training works
-- TRACE-style highlight metrics run
+- MobileCLIP-S0 is the visual encoder and remains frozen during training
+- pre-pooling MobileCLIP spatial features are compressed with learned slots
+- each frame contributes TRACE-style fixed-width discrete time embeddings
+- the LCEM prefix is ordered as per-frame visual slots + time tokens, followed by instruction/event tokens
+- variable-length frame batches are padded and attention-masked
+- focused architecture tests pass
 
-It is not yet a final strong model. To get better predictions, you need a larger clean video subset and longer training.
+It is not yet a final trained model. Tiny-subset overfitting and staged training
+must be validated before scaling the real-video dataset.
+
+The MobileCLIP checkpoint is intentionally not committed. Place Apple's
+official `mobileclip_s0.pt` at `TinyTrace/checkpoints/mobileclip_s0.pt`.
 
 ## Project Structure
 
@@ -45,6 +51,20 @@ Main code paths:
 ```bash
 python3 -m venv TinyTrace/.venv
 TinyTrace/.venv/bin/pip install -r TinyTrace/requirements.txt
+```
+
+On Windows PowerShell:
+
+```powershell
+python -m venv TinyTrace/.venv
+TinyTrace/.venv/Scripts/python.exe -m pip install -r TinyTrace/requirements.txt
+```
+
+Run the focused tests before training:
+
+```powershell
+cd TinyTrace
+.venv/Scripts/python.exe -m unittest discover -s tests -v
 ```
 
 ## Smoke Test With Synthetic Data

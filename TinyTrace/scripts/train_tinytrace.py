@@ -17,6 +17,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--dataset-size", type=int, default=128)
     parser.add_argument("--dataset-json", type=str, default="")
+    parser.add_argument("--config", type=str, default="TinyTrace/configs/tinytrace_baseline.json")
     parser.add_argument("--output-dir", type=str, default="TinyTrace/outputs")
     parser.add_argument("--device", type=str, default="cpu")
     return parser.parse_args()
@@ -26,7 +27,7 @@ def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
 
-    config = TinyTraceConfig()
+    config = TinyTraceConfig.from_json(args.config)
     dataset = (
         JsonTinyTraceDataset(args.dataset_json, config=config)
         if args.dataset_json
@@ -35,7 +36,10 @@ def main() -> None:
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=tinytrace_collate_fn)
 
     model = TinyTraceModel(config).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(
+        (parameter for parameter in model.parameters() if parameter.requires_grad),
+        lr=args.lr,
+    )
 
     history = []
     model.train()
@@ -45,11 +49,19 @@ def main() -> None:
         for batch in loader:
             frames = batch["frames"].to(device)
             frame_times = batch["frame_times"].to(device)
+            frame_mask = batch["frame_mask"].to(device)
             token_ids = batch["token_ids"].to(device)
             label_types = batch["label_types"].to(device)
 
             optimizer.zero_grad()
-            output = model(frames, frame_times, token_ids, labels=token_ids, label_types=label_types)
+            output = model(
+                frames,
+                frame_times,
+                token_ids,
+                labels=token_ids,
+                label_types=label_types,
+                frame_mask=frame_mask,
+            )
             if output.loss is None:
                 continue
             output.loss.backward()
@@ -64,7 +76,7 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    torch.save({"model_state": model.state_dict(), "config": config.__dict__}, output_dir / "tinytrace.pt")
+    torch.save({"model_state": model.state_dict(), "config": config.to_dict()}, output_dir / "tinytrace.pt")
     (output_dir / "history.json").write_text(json.dumps(history, indent=2))
 
 
