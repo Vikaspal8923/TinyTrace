@@ -3,7 +3,7 @@ import unittest
 import torch
 
 from tinytrace.config import TinyTraceConfig
-from tinytrace.data import tinytrace_collate_fn
+from tinytrace.data import SyntheticTinyTraceDataset, tinytrace_collate_fn
 from tinytrace.model import TinyTraceModel
 from tinytrace.tokenizers import NumericTokenizer
 
@@ -63,6 +63,15 @@ class StabilityTests(unittest.TestCase):
                 torch.tensor([[1, 3], [1, 3]]),
                 max_new_tokens=1,
             )
+
+    def test_synthetic_samples_have_distinct_deterministic_visual_patterns(self) -> None:
+        config = TinyTraceConfig(image_size=32, max_frames=2)
+        first = SyntheticTinyTraceDataset(config, size=2, seed=7)
+        second = SyntheticTinyTraceDataset(config, size=2, seed=7)
+
+        self.assertTrue(torch.equal(first[0]["frames"], second[0]["frames"]))
+        self.assertFalse(torch.equal(first[0]["frames"], first[1]["frames"]))
+        self.assertEqual(first[0]["instruction"], first[1]["instruction"])
 
 
 if __name__ == "__main__":

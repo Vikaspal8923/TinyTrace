@@ -63,6 +63,22 @@ class MobileCLIPSpatialEncoderTests(unittest.TestCase):
         decoded = "".join(config.time_vocab[index] for index in time_ids[0, 1].tolist())
         self.assertEqual(decoded, "0012.5")
 
+    def test_cached_mobileclip_features_preserve_prefix(self) -> None:
+        config = TinyTraceConfig(max_frames=2)
+        model = TinyTraceModel(config, mobileclip_backbone=FakeMobileCLIPBackbone()).eval()
+        frames = torch.rand(1, 2, 3, 96, 96)
+        frame_times = torch.tensor([[0.0, 1.0]])
+
+        patch_features = model.visual_encoder.extract_patch_features(frames)
+        direct = model.build_visual_prefix(frames, frame_times)
+        cached = model.build_visual_prefix(
+            frames,
+            frame_times,
+            visual_patch_features=patch_features,
+        )
+
+        self.assertTrue(torch.equal(direct, cached))
+
 
 if __name__ == "__main__":
     unittest.main()

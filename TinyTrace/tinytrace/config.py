@@ -27,7 +27,7 @@ class TinyTraceConfig:
     max_caption_tokens: int = 20
     min_caption_tokens: int = 5
     max_events: int = 3
-    max_generated_tokens: int = 96
+    max_generated_tokens: int = 128
     timestamp_value_count: int = 2
     score_value_count: int = 1
 

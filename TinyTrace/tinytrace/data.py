@@ -28,7 +28,7 @@ class SyntheticTinyTraceDataset(Dataset):
     def _make_sample(self, index: int) -> dict:
         num_frames = self.config.max_frames
         frame_times = torch.linspace(0.0, float(num_frames - 1), steps=num_frames)
-        frames = torch.rand(num_frames, 3, self.config.image_size, self.config.image_size)
+        frames = self._make_structured_frames(index, num_frames)
 
         num_events = self.rng.randint(1, self.config.max_events)
         events = []
@@ -50,6 +50,33 @@ class SyntheticTinyTraceDataset(Dataset):
             "label_types": torch.tensor(label_types, dtype=torch.long),
             "prompt_length": prompt_length,
         }
+
+    def _make_structured_frames(self, index: int, num_frames: int) -> torch.Tensor:
+        """Create deterministic, MobileCLIP-visible patterns for overfit tests.
+
+        Pure random noise is out of distribution for a frozen image encoder and
+        can collapse to nearly identical representations. These samples retain
+        synthetic simplicity while making identity available only through the
+        visual prefix, not through the shared instruction.
+        """
+        size = self.config.image_size
+        action_id = index % 5
+        frames = torch.zeros(num_frames, 3, size, size)
+        x = torch.linspace(0.0, 1.0, steps=size).view(1, size).expand(size, size)
+        y = torch.linspace(0.0, 1.0, steps=size).view(size, 1).expand(size, size)
+        stripe_width = max(2, size // 12)
+
+        for frame_index in range(num_frames):
+            frames[frame_index, 0] = (action_id + 1) / 5.0
+            frames[frame_index, 1] = x if action_id % 2 == 0 else y
+            frames[frame_index, 2] = (frame_index + 1) / num_frames
+            stripe_start = (action_id * stripe_width * 2 + frame_index * stripe_width) % size
+            stripe_end = min(size, stripe_start + stripe_width)
+            if action_id % 2 == 0:
+                frames[frame_index, :, :, stripe_start:stripe_end] = 1.0
+            else:
+                frames[frame_index, :, stripe_start:stripe_end, :] = 1.0
+        return frames
 
     def _serialize_example(self, events: list[dict], instruction: str) -> tuple[list[int], list[int], int]:
         return serialize_example(

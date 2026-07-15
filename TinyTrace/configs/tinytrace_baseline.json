@@ -10,5 +10,5 @@
   "num_layers": 4,
   "num_heads": 6,
   "max_events": 3,
-  "max_generated_tokens": 96
+  "max_generated_tokens": 128
 }

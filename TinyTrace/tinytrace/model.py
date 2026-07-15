@@ -45,12 +45,39 @@ class LightweightVisualEncoder(nn.Module):
         )
         self.config = config
 
-    def forward(self, frames: torch.Tensor) -> torch.Tensor:
+    def extract_patch_features(self, frames: torch.Tensor) -> torch.Tensor:
         batch, num_frames, channels, height, width = frames.shape
         patches = self.mobileclip(frames.reshape(batch * num_frames, channels, height, width))
-        compressed = self.compressor(patches)
-        compressed = compressed.view(batch, num_frames, self.config.compressed_visual_tokens, -1)
-        return compressed
+        return patches.view(batch, num_frames, patches.size(1), patches.size(2))
+
+    def compress_patch_features(self, patch_features: torch.Tensor) -> torch.Tensor:
+        if patch_features.ndim != 4:
+            raise ValueError(
+                "MobileCLIP patch features must have shape "
+                "[batch, num_frames, num_patches, channels]."
+            )
+        batch, num_frames, num_patches, channels = patch_features.shape
+        if channels != self.config.visual_hidden_dim:
+            raise ValueError(
+                f"Expected {self.config.visual_hidden_dim} MobileCLIP channels, received {channels}."
+            )
+        flattened = patch_features.reshape(batch * num_frames, num_patches, channels)
+        compressed = self.compressor(flattened)
+        return compressed.view(batch, num_frames, self.config.compressed_visual_tokens, -1)
+
+    def forward(
+        self,
+        frames: torch.Tensor,
+        patch_features: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if patch_features is None:
+            patch_features = self.extract_patch_features(frames)
+        elif patch_features.shape[:2] != frames.shape[:2]:
+            raise ValueError(
+                "Cached MobileCLIP features do not match the frame batch/time dimensions: "
+                f"{tuple(patch_features.shape[:2])} vs. {tuple(frames.shape[:2])}."
+            )
+        return self.compress_patch_features(patch_features)
 
 
 class DecoderBlock(nn.Module):
@@ -144,8 +171,13 @@ class TinyTraceModel(nn.Module):
             rows.append(sample_rows)
         return torch.tensor(rows, dtype=torch.long, device=frame_times.device)
 
-    def build_visual_prefix(self, frames: torch.Tensor, frame_times: torch.Tensor) -> torch.Tensor:
-        visual_tokens = self.visual_encoder(frames)
+    def build_visual_prefix(
+        self,
+        frames: torch.Tensor,
+        frame_times: torch.Tensor,
+        visual_patch_features: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        visual_tokens = self.visual_encoder(frames, patch_features=visual_patch_features)
         if visual_tokens.shape[:2] != frame_times.shape:
             raise ValueError(
                 "Frame/time shape mismatch: visual encoder produced "
@@ -238,8 +270,13 @@ class TinyTraceModel(nn.Module):
         labels: torch.Tensor | None = None,
         label_types: torch.Tensor | None = None,
         frame_mask: torch.Tensor | None = None,
+        visual_patch_features: torch.Tensor | None = None,
     ) -> TinyTraceOutput:
-        visual_tokens = self.build_visual_prefix(frames, frame_times)
+        visual_tokens = self.build_visual_prefix(
+            frames,
+            frame_times,
+            visual_patch_features=visual_patch_features,
+        )
         token_embeddings = self.embed_mixed_tokens(token_ids)
         x = torch.cat([visual_tokens, token_embeddings], dim=1)
         x = self.dropout(self.position(x))
@@ -309,6 +346,28 @@ class TinyTraceModel(nn.Module):
                 score_sync_targets = torch.zeros_like(target_tokens[score_sync_mask])
                 loss_terms.append(F.cross_entropy(hidden_score[score_sync_mask], score_sync_targets))
 
+            # A caption <sync> is followed either by EOS (final event) or by
+            # the first timestamp token (another event). The task heads are
+            # otherwise trained independently, so this explicit boundary loss
+            # calibrates the cross-head decision used by generation.
+            previous_types = label_types[:, :-1]
+            boundary_mask = (previous_types == 1) & valid_mask
+            if boundary_mask.any():
+                boundary_logits = torch.cat(
+                    [
+                        hidden_text[:, :, self.config.eos_token_id].unsqueeze(-1),
+                        hidden_time,
+                    ],
+                    dim=-1,
+                )
+                boundary_tokens = target_tokens[boundary_mask]
+                boundary_targets = torch.where(
+                    boundary_tokens == self.config.eos_token_id,
+                    torch.zeros_like(boundary_tokens),
+                    boundary_tokens - self.config.time_token_base + 1,
+                )
+                loss_terms.append(F.cross_entropy(boundary_logits[boundary_mask], boundary_targets))
+
             loss = sum(loss_terms) if loss_terms else None
 
         return TinyTraceOutput(loss=loss, logits=full_logits, text_logits=text_logits, time_logits=time_logits, score_logits=score_logits)
@@ -321,6 +380,7 @@ class TinyTraceModel(nn.Module):
         prompt_ids: torch.Tensor,
         max_new_tokens: int,
         frame_mask: torch.Tensor | None = None,
+        visual_patch_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if prompt_ids.size(0) != 1:
             raise ValueError(
@@ -333,7 +393,48 @@ class TinyTraceModel(nn.Module):
         event_count = 0
         min_time_tokens, min_score_tokens = self._expected_phase_lengths()
         for _ in range(max_new_tokens):
-            output = self.forward(frames, frame_times, generated, frame_mask=frame_mask)
+            output = self.forward(
+                frames,
+                frame_times,
+                generated,
+                frame_mask=frame_mask,
+                visual_patch_features=visual_patch_features,
+            )
+            if mode == "boundary":
+                if event_count >= self.config.max_events:
+                    next_token = torch.full(
+                        (generated.size(0), 1),
+                        self.config.eos_token_id,
+                        dtype=torch.long,
+                        device=generated.device,
+                    )
+                else:
+                    time_logits = output.time_logits[:, -1, :].clone()
+                    allowed = self._numeric_format_mask(
+                        time_logits.device,
+                        "time",
+                        position=0,
+                        vocab_size=time_logits.size(-1),
+                    )
+                    time_logits[:, ~allowed] = float("-inf")
+                    best_time_logit, best_time_id = torch.max(time_logits, dim=-1, keepdim=True)
+                    eos_logit = output.text_logits[:, -1, self.config.eos_token_id].unsqueeze(-1)
+                    choose_eos = eos_logit >= best_time_logit
+                    next_token = best_time_id + self.config.time_token_base
+                    next_token = torch.where(
+                        choose_eos,
+                        torch.full_like(next_token, self.config.eos_token_id),
+                        next_token,
+                    )
+                    if not bool(choose_eos.item()):
+                        mode = "time"
+                        phase_token_count = 1
+
+                generated = torch.cat([generated, next_token], dim=1)
+                if next_token[0, 0].item() == self.config.eos_token_id:
+                    break
+                continue
+
             if mode == "time":
                 next_logits = output.time_logits[:, -1, :].clone()
             elif mode == "score":
@@ -387,11 +488,7 @@ class TinyTraceModel(nn.Module):
                     mode = "caption"
                 else:
                     event_count += 1
-                    if event_count >= self.config.max_events:
-                        eos = torch.full_like(next_token, self.config.eos_token_id)
-                        generated = torch.cat([generated[:, :-1], eos], dim=1)
-                        break
-                    mode = "time"
+                    mode = "boundary"
                 phase_token_count = 0
             elif token_value == self.config.eos_token_id:
                 break

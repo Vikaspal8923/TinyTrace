@@ -191,7 +191,7 @@ Build confidence continuously instead of postponing all tests.
 - `completed`
 
 Notes:
-- 13 focused tests cover every required invariant listed above
+- 15 focused tests cover every required invariant listed above
 
 ## Phase 4 — Synthetic Validation Gate
 
@@ -219,11 +219,12 @@ Prove the architecture can learn before spending time on real-video scale-up.
 
 ### Status
 
-- `pending`
+- `completed`
 
 Notes:
-- the superseded placeholder visual architecture reportedly overfit synthetic samples
-- this gate must be rerun for the architecture-aligned MobileCLIP version
+- the architecture-aligned MobileCLIP version overfit 4 deterministic visual samples
+- measured result: final loss `0.000692`, exact decoded matches `4/4`
+- artifacts are written to the ignored `outputs-synthetic-overfit/` directory
 
 ## Phase 5 — Dataset Preparation
 
@@ -362,8 +363,8 @@ Produce reproducible thesis-quality outputs.
 | M1a | MobileCLIP integrated and frozen; spatial feature extraction works | Completed |
 | M1b | MobileCLIP feature shapes verified against compression path | Completed |
 | M2 | TRACE-style token pipeline implemented | Completed |
-| M3 | Core tests pass | Completed (13 tests) |
-| M4 | Model overfits 4–8 synthetic samples | Pending rerun |
+| M3 | Core tests pass | Completed (15 tests) |
+| M4 | Model overfits 4–8 synthetic samples | Completed (4/4 exact) |
 | M5 | 50–100 valid QVHighlights videos prepared | Pending |
 | M6 | Initial real-data training completes with checkpoints and predictions | Pending |
 | M7 | Two-stage training implemented | Pending |
@@ -371,11 +372,11 @@ Produce reproducible thesis-quality outputs.
 
 ## Immediate Next Actions
 
-1. Run the architecture-aligned synthetic overfit gate on 4 to 8 fixed samples.
-2. Save its config, loss history, checkpoint, and decoded predictions.
-3. If memorization fails, debug the architecture or loss before using real data.
-4. Add per-sequence adaptive-head state before enabling batched generation.
-5. Only after the synthetic gate passes, scale the dataset to 50+ valid videos.
+1. Validate QVHighlights schema, timestamp ranges, score ranges, and video paths.
+2. Add per-sequence adaptive-head state before enabling batched generation.
+3. Prepare explicit, deterministic train/validation split files.
+4. Download and verify 50 to 100 matching QVHighlights clips.
+5. Begin controlled real-data training only after every selected clip passes validation.
 
 ## Important Warning
 

@@ -125,12 +125,17 @@ class CorePipelineTests(unittest.TestCase):
             torch.rand(1, 1, 3, 16, 16),
             torch.zeros(1, 1),
             prompt,
-            max_new_tokens=3,
+            max_new_tokens=4,
         )
 
         self.assertEqual(
-            generated[0, -3:].tolist(),
-            [config.sync_token_id, config.sync_token_id, config.eos_token_id],
+            generated[0, -4:].tolist(),
+            [
+                config.sync_token_id,
+                config.sync_token_id,
+                config.sync_token_id,
+                config.eos_token_id,
+            ],
         )
 
     def test_checkpoint_config_and_state_round_trip(self) -> None:
