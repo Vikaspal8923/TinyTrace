@@ -10,6 +10,7 @@ import torch
 from torch.utils.data import Dataset
 
 from .config import TinyTraceConfig
+from .serialization import serialize_example
 from .tokenizers import CharTokenizer, NumericTokenizer
 
 
@@ -51,38 +52,14 @@ class SyntheticTinyTraceDataset(Dataset):
         }
 
     def _serialize_example(self, events: list[dict], instruction: str) -> tuple[list[int], list[int], int]:
-        instruction_ids = [self.config.bos_token_id]
-        instruction_ids.extend(self.text_tokenizer.encode(instruction)[: self.config.max_text_len])
-        instruction_ids.append(self.config.video_token_id)
-        prompt_length = len(instruction_ids)
-
-        token_ids = instruction_ids
-        label_types = [-1] * len(instruction_ids)
-
-        for event in events:
-            time_ids = [
-                self.config.sync_token_id if idx == 0 else self.config.time_token_base + idx
-                for idx in self.time_tokenizer.encode(event["timestamp"])
-            ]
-            score_ids = [
-                self.config.sync_token_id if idx == 0 else self.config.score_token_base + idx
-                for idx in self.score_tokenizer.encode(event["score"])
-            ]
-            caption_ids = self.text_tokenizer.encode(event["caption"])[: self.config.max_caption_tokens]
-            caption_ids.append(self.config.sync_token_id)
-
-            token_ids.extend(time_ids)
-            label_types.extend([2 if token != self.config.sync_token_id else 4 for token in time_ids])
-
-            token_ids.extend(score_ids)
-            label_types.extend([3 if token != self.config.sync_token_id else 5 for token in score_ids])
-
-            token_ids.extend(caption_ids)
-            label_types.extend([0 if token != self.config.sync_token_id else 1 for token in caption_ids])
-
-        token_ids.append(self.config.eos_token_id)
-        label_types.append(0)
-        return token_ids, label_types, prompt_length
+        return serialize_example(
+            events,
+            instruction,
+            self.config,
+            self.text_tokenizer,
+            self.time_tokenizer,
+            self.score_tokenizer,
+        )
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -194,38 +171,14 @@ class JsonTinyTraceDataset(Dataset):
         raise ValueError(f"Could not decode frame near {timestamp:.3f}s from {video_path}")
 
     def _serialize_example(self, events: list[dict], instruction: str) -> tuple[list[int], list[int], int]:
-        instruction_ids = [self.config.bos_token_id]
-        instruction_ids.extend(self.text_tokenizer.encode(instruction)[: self.config.max_text_len])
-        instruction_ids.append(self.config.video_token_id)
-        prompt_length = len(instruction_ids)
-
-        token_ids = instruction_ids
-        label_types = [-1] * len(instruction_ids)
-
-        for event in events:
-            time_ids = [
-                self.config.sync_token_id if idx == 0 else self.config.time_token_base + idx
-                for idx in self.time_tokenizer.encode(event["timestamp"])
-            ]
-            score_ids = [
-                self.config.sync_token_id if idx == 0 else self.config.score_token_base + idx
-                for idx in self.score_tokenizer.encode(event["score"])
-            ]
-            caption_ids = self.text_tokenizer.encode(event["caption"])[: self.config.max_caption_tokens]
-            caption_ids.append(self.config.sync_token_id)
-
-            token_ids.extend(time_ids)
-            label_types.extend([2 if token != self.config.sync_token_id else 4 for token in time_ids])
-
-            token_ids.extend(score_ids)
-            label_types.extend([3 if token != self.config.sync_token_id else 5 for token in score_ids])
-
-            token_ids.extend(caption_ids)
-            label_types.extend([0 if token != self.config.sync_token_id else 1 for token in caption_ids])
-
-        token_ids.append(self.config.eos_token_id)
-        label_types.append(0)
-        return token_ids, label_types, prompt_length
+        return serialize_example(
+            events,
+            instruction,
+            self.config,
+            self.text_tokenizer,
+            self.time_tokenizer,
+            self.score_tokenizer,
+        )
 
     def __len__(self) -> int:
         return len(self.samples)

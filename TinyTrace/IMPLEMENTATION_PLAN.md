@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This document is the execution roadmap for the B.Tech project version of TinyTrace. It is designed to keep implementation aligned with the frozen architecture in [trace_lightwieght.md](/home/vikaspal/Desktop/Traceall/TinyTrace/trace_lightwieght.md), while also pushing the codebase toward research-grade quality and later publication readiness.
+This document is the execution roadmap for the B.Tech project version of TinyTrace. It is designed to keep implementation aligned with the frozen architecture in [trace_lightwieght.md](trace_lightwieght.md), while also pushing the codebase toward research-grade quality and later publication readiness.
 
 This plan removes week-based scheduling and instead focuses on phase gates, deliverables, and exit criteria.
 
@@ -25,12 +25,12 @@ The current workspace already contains a runnable TinyTrace prototype, but it is
 
 ### Still incomplete / important gaps
 
-- real MobileCLIP integration is not yet implemented in this workspace
-- current visual encoder is still a lightweight conv-based placeholder
-- visual token compression is prototype-level
-- prompt serialization is simplified
-- decoder generation on real data is still unstable
-- training pipeline is working, but not yet research-grade
+- real MobileCLIP-S0 is integrated, frozen, and shape-verified
+- spatial MobileCLIP features feed learned slot compression
+- frame timestamps use TRACE-style discrete numeric embeddings
+- prompt/event serialization is centralized and parser round-trips are tested
+- decoder generation is intentionally restricted to batch size one until per-sequence head state is implemented
+- the architecture-aligned model has not yet passed the required synthetic overfit gate
 
 ## Guiding Rules
 
@@ -70,11 +70,10 @@ Lock down the exact implementation contract before further architecture work.
 
 ### Status
 
-- `partial`
+- `completed`
 
 Notes:
-- `trace_lightwieght.md` already freezes the high-level design
-- a compact execution contract document for code-level tensor flow is still missing
+- `ARCHITECTURE_CONTRACT.md` records the executable tensor and token contract
 
 ## Phase 1 — Architecture Alignment
 
@@ -104,7 +103,7 @@ Make the implementation match the frozen TinyTrace architecture.
 
 #### Status
 
-- `pending`
+- `completed`
 
 ### Phase 1B — TRACE-style token pipeline
 
@@ -126,11 +125,11 @@ Make the implementation match the frozen TinyTrace architecture.
 
 #### Status
 
-- `partial`
+- `completed`
 
 Notes:
-- token flow and parser exist
-- full TRACE-style time-token alignment is not complete yet
+- each frame contributes four compressed visual tokens and six discrete time embeddings
+- the real MobileCLIP-S0 path and full LCEM forward path are shape-verified
 
 ## Phase 2 — Engineering Stabilization
 
@@ -158,8 +157,8 @@ Make the system reliable and maintainable.
 - `partial`
 
 Notes:
-- baseline training and inference work
-- pipeline is not yet polished enough for sustained experiments
+- config restoration, shared serialization, defensive parsing, dependencies, and variable-frame masking are implemented
+- batched generation still requires independent per-sequence head-switching state
 
 ## Phase 3 — Tests Integrated With Development
 
@@ -189,7 +188,10 @@ Build confidence continuously instead of postponing all tests.
 
 ### Status
 
-- `pending`
+- `completed`
+
+Notes:
+- 13 focused tests cover every required invariant listed above
 
 ## Phase 4 — Synthetic Validation Gate
 
@@ -217,10 +219,11 @@ Prove the architecture can learn before spending time on real-video scale-up.
 
 ### Status
 
-- `completed`
+- `pending`
 
 Notes:
-- synthetic baseline already overfits successfully in the current workspace
+- the superseded placeholder visual architecture reportedly overfit synthetic samples
+- this gate must be rerun for the architecture-aligned MobileCLIP version
 
 ## Phase 5 — Dataset Preparation
 
@@ -283,11 +286,11 @@ Validate the real-data pipeline on a controlled subset.
 
 ### Status
 
-- `partial`
+- `pending`
 
 Notes:
-- smoke training on a tiny real subset is already done
-- proper 50 to 100 video training has not started
+- earlier smoke training used the superseded placeholder architecture
+- architecture-aligned real-data training has not started
 
 ## Phase 7 — TRACE-Style Training Strategy
 
@@ -355,24 +358,24 @@ Produce reproducible thesis-quality outputs.
 
 | Milestone | Success Criteria | Status |
 |---|---|---|
-| M0 | Architecture/tensor contract documented | Partial |
-| M1a | MobileCLIP integrated and frozen; spatial feature extraction works | Pending |
-| M1b | MobileCLIP feature shapes verified against compression path | Pending |
-| M2 | TRACE-style token pipeline implemented | Partial |
-| M3 | Core tests pass | Pending |
-| M4 | Model overfits 4–8 synthetic samples | Completed |
+| M0 | Architecture/tensor contract documented | Completed |
+| M1a | MobileCLIP integrated and frozen; spatial feature extraction works | Completed |
+| M1b | MobileCLIP feature shapes verified against compression path | Completed |
+| M2 | TRACE-style token pipeline implemented | Completed |
+| M3 | Core tests pass | Completed (13 tests) |
+| M4 | Model overfits 4–8 synthetic samples | Pending rerun |
 | M5 | 50–100 valid QVHighlights videos prepared | Pending |
-| M6 | Initial real-data training completes with checkpoints and predictions | Partial |
+| M6 | Initial real-data training completes with checkpoints and predictions | Pending |
 | M7 | Two-stage training implemented | Pending |
 | M8 | Evaluation metrics and thesis-ready artifacts generated | Pending |
 
 ## Immediate Next Actions
 
-1. Create the explicit architecture/tensor contract file.
-2. Replace the placeholder conv visual encoder with MobileCLIP-S0.
-3. Add tests alongside the MobileCLIP integration work.
-4. Align the frame-time representation with the frozen TRACE-style token pipeline.
-5. Only after that, scale the dataset from tiny subset to 50+ valid videos.
+1. Run the architecture-aligned synthetic overfit gate on 4 to 8 fixed samples.
+2. Save its config, loss history, checkpoint, and decoded predictions.
+3. If memorization fails, debug the architecture or loss before using real data.
+4. Add per-sequence adaptive-head state before enabling batched generation.
+5. Only after the synthetic gate passes, scale the dataset to 50+ valid videos.
 
 ## Important Warning
 
