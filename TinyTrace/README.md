@@ -64,11 +64,13 @@ TinyTrace/.venv/Scripts/python.exe -m pip install -r TinyTrace/requirements.txt
 TinyTrace/.venv/Scripts/python.exe TinyTrace/scripts/setup_mobileclip.py
 ```
 
-Run the focused tests before training:
+For development, install the test dependencies and run the complete suite before
+training:
 
 ```powershell
 cd TinyTrace
-.venv/Scripts/python.exe -m unittest discover -s tests -v
+.venv/Scripts/python.exe -m pip install -r requirements-dev.txt
+.venv/Scripts/python.exe -m pytest -q
 ```
 
 ## Smoke Test With Synthetic Data
@@ -199,24 +201,41 @@ PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python TinyTrace/scripts/train_tinytrac
   --val-dataset-json TinyTrace/data/qvh_tinytrace_val.json \
   --epochs 10 \
   --batch-size 2 \
+  --warmup-ratio 0.05 \
+  --min-lr-ratio 0.1 \
+  --amp auto \
+  --early-stopping-patience 3 \
   --output-dir TinyTrace/outputs-qvh
 ```
 
 Real-data training does not silently substitute random frames. Use
-`--allow-random-frames` only for deliberate debugging. Resume a stopped run by
-setting the total target epoch and loading `latest.pt`:
+`--allow-random-frames` only for deliberate debugging. Best-checkpoint and
+early-stopping decisions use validation loss whenever `--val-dataset-json` is
+provided. Resume a stopped scheduled run with the same total `--epochs` value
+that was used when the run started:
 
 ```bash
 PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python TinyTrace/scripts/train_tinytrace.py \
   --dataset-json TinyTrace/data/qvh_tinytrace_subset.json \
   --val-dataset-json TinyTrace/data/qvh_tinytrace_val.json \
-  --epochs 20 \
+  --epochs 10 \
   --resume TinyTrace/outputs-qvh/checkpoints/latest.pt \
   --output-dir TinyTrace/outputs-qvh
 ```
 
-Each run writes `config.json`, `history.json`, `checkpoints/latest.pt`,
+Each run writes `config.json`, `training_config.json`, `optimizer_groups.json`,
+`training_log.jsonl`, `history.json`, `checkpoints/latest.pt`,
 `checkpoints/best.pt`, periodic checkpoints, and epoch prediction JSON files.
+The JSONL log includes per-task raw/weighted losses, target counts, named-group
+learning rates, gradient norms, clipping events, throughput, and validation
+records. `--amp auto` selects BF16 or FP16 on supported CUDA hardware and stays
+in FP32 on CPU. Use `--amp bf16` explicitly to test CPU BF16.
+
+The optimizer uses named groups for compression, embeddings, LCEM, task heads,
+and MobileCLIP, with separate decay/no-decay groups. Linear warmup is followed
+by cosine decay. Checkpoints restore optimizer, scheduler, AMP scaler, early
+stopping, and global-step state; older one/two-group optimizer checkpoints are
+migrated when possible.
 
 For a quick smoke run:
 

@@ -165,6 +165,9 @@ Notes:
 - JSON construction is metadata-only; video decoding occurs in `__getitem__` and supports an atomic persistent frame cache
 - MobileCLIP setup is pinned and the official checkpoint is checksum-verified
 - training supports validation, best/latest/periodic checkpoints, resume, history, and prediction snapshots
+- named optimizer groups separate compression, embeddings, LCEM, task heads, and MobileCLIP parameters
+- linear warmup, cosine decay, gradient clipping, AMP, validation-selected checkpoints, and early stopping are implemented
+- machine-readable training logs include per-task losses, target counts, learning rates, gradient norms, and throughput
 - batched generation still requires independent per-sequence head-switching state
 
 ## Phase 3 — Tests Integrated With Development

@@ -387,7 +387,14 @@ class JsonTinyTraceDataset(Dataset):
                 },
                 temporary_path,
             )
-            temporary_path.replace(cache_path)
+            try:
+                temporary_path.replace(cache_path)
+            except PermissionError:
+                # On Windows another worker may have published and immediately
+                # opened the same cache entry. Its complete atomic result wins;
+                # only fail when no destination was actually published.
+                if not cache_path.is_file():
+                    raise
         finally:
             temporary_path.unlink(missing_ok=True)
         return frames, frame_times
@@ -430,6 +437,11 @@ class JsonTinyTraceDataset(Dataset):
             if frame_times.numel() > 1 and (frame_times[1:] < frame_times[:-1]).any():
                 raise ValueError("cached frame_times must be monotonically nondecreasing")
             return frames, frame_times
+        except PermissionError as exc:
+            # A concurrent Windows reader/writer can hold the file briefly.
+            # Treat that as a cache miss without deleting another worker's entry.
+            print(f"TinyTrace frame cache is temporarily unavailable {cache_path}: {exc}")
+            return None
         except Exception as exc:
             cache_path.unlink(missing_ok=True)
             print(f"Ignoring invalid TinyTrace frame cache {cache_path}: {exc}")
