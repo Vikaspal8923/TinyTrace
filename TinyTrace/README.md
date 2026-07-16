@@ -282,6 +282,78 @@ PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python TinyTrace/scripts/eval_tinytrace
   --save-path TinyTrace/outputs-qvh-final/qvh_val_metrics.json
 ```
 
+## Final Training Setup
+
+Before final training, TinyTrace needs:
+
+1. the Python dependencies from `TinyTrace/requirements.txt`
+2. the pretrained `MobileCLIP-S0` checkpoint
+
+Install dependencies:
+
+```bash
+cd /home/vikaspal/Desktop/Traceall
+TinyTrace/.venv/bin/pip install -r TinyTrace/requirements.txt
+```
+
+Download and verify the MobileCLIP checkpoint:
+
+```bash
+cd /home/vikaspal/Desktop/Traceall
+PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python TinyTrace/scripts/setup_mobileclip.py
+```
+
+That will place the pretrained checkpoint at:
+
+```bash
+TinyTrace/checkpoints/mobileclip_s0.pt
+```
+
+This checkpoint is the pretrained weight file for the MobileCLIP visual backbone.
+TinyTrace does not learn those visual features from scratch. It starts from this
+already-trained MobileCLIP model, freezes it, and trains the lightweight
+TinyTrace parts on top of it.
+
+## One-File Final Training Run
+
+Use this training profile file:
+
+```bash
+TinyTrace/configs/final_train_qvh500.json
+```
+
+Edit that file if you want to change:
+
+- epochs
+- batch size
+- learning rate
+- device
+- output folder
+- dataset paths
+
+Then run final training with one command:
+
+```bash
+cd /home/vikaspal/Desktop/Traceall
+PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python TinyTrace/scripts/run_training_profile.py \
+  --profile TinyTrace/configs/final_train_qvh500.json
+```
+
+Even simpler, you can use the dedicated final-training launcher:
+
+```bash
+cd /home/vikaspal/Desktop/Traceall
+PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python TinyTrace/scripts/train_final_qvh500.py
+```
+
+If the MobileCLIP checkpoint is missing, this launcher will first try to
+download it automatically and then start training.
+
+This profile currently trains on:
+
+- `final_qvhighlights_tinytrace/annotations/tinytrace_train.json`
+- validates on `final_qvhighlights_tinytrace/annotations/tinytrace_val.json`
+
 ## Check One Video's Prediction
 
 To inspect what TinyTrace currently predicts for one video:

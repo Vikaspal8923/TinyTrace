@@ -19,6 +19,7 @@ from tinytrace import (
     TinyTraceConfig,
     TinyTraceModel,
     decode_event_sequence,
+    evaluate_event_predictions,
     tinytrace_collate_fn,
 )
 from tinytrace.tokenizers import CharTokenizer, NumericTokenizer
@@ -42,7 +43,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-every", type=int, default=5)
     parser.add_argument("--prediction-every", type=int, default=1)
     parser.add_argument("--prediction-samples", type=int, default=2)
+    parser.add_argument("--metrics-every", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--log-every", type=int, default=25)
+    parser.add_argument("--max-steps-per-epoch", type=int, default=0)
+    parser.add_argument("--stage2-start-epoch", type=int, default=0)
+    parser.add_argument("--stage2-visual-lr-scale", type=float, default=0.1)
+    parser.add_argument("--stage2-unfreeze-strategy", type=str, default="conv_exp")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", type=str, default="cpu")
     return parser.parse_args()
@@ -102,14 +109,21 @@ def run_epoch(
     device: torch.device,
     optimizer: torch.optim.Optimizer | None,
     gradient_clip: float,
+    epoch: int,
+    log_every: int,
+    split: str,
+    max_steps_per_epoch: int = 0,
 ) -> float:
     training = optimizer is not None
     model.train(training)
     running_loss = 0.0
     steps = 0
+    total_steps = len(loader)
     context = torch.enable_grad() if training else torch.no_grad()
     with context:
-        for raw_batch in loader:
+        for step_index, raw_batch in enumerate(loader, start=1):
+            if max_steps_per_epoch > 0 and step_index > max_steps_per_epoch:
+                break
             batch = move_batch(raw_batch, device)
             if training:
                 optimizer.zero_grad(set_to_none=True)
@@ -133,6 +147,12 @@ def run_epoch(
                 optimizer.step()
             running_loss += float(output.loss.detach().cpu())
             steps += 1
+            if log_every > 0 and (step_index % log_every == 0 or step_index == total_steps):
+                average_loss = running_loss / steps
+                print(
+                    f"{split}_step epoch={epoch} step={step_index}/{total_steps} "
+                    f"loss={float(output.loss.detach().cpu()):.6f} avg_loss={average_loss:.6f}"
+                )
     if steps == 0:
         raise RuntimeError("No loss-producing batches were available.")
     return running_loss / steps
@@ -142,6 +162,30 @@ def atomic_json(path: Path, payload: object) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     temporary.replace(path)
+
+
+def build_optimizer(
+    model: TinyTraceModel,
+    lr: float,
+    weight_decay: float,
+    visual_lr_scale: float = 1.0,
+) -> torch.optim.Optimizer:
+    visual_params = []
+    other_params = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if name.startswith("visual_encoder.mobileclip."):
+            visual_params.append(parameter)
+        else:
+            other_params.append(parameter)
+
+    param_groups = []
+    if other_params:
+        param_groups.append({"params": other_params, "lr": lr})
+    if visual_params:
+        param_groups.append({"params": visual_params, "lr": lr * visual_lr_scale})
+    return torch.optim.AdamW(param_groups, weight_decay=weight_decay)
 
 
 def save_checkpoint(
@@ -169,23 +213,25 @@ def save_checkpoint(
 
 
 @torch.no_grad()
-def dump_predictions(
+def collect_predictions(
     model: TinyTraceModel,
     dataset: Dataset,
     config: TinyTraceConfig,
     device: torch.device,
-    path: Path,
-    sample_count: int,
-) -> None:
+    sample_limit: int | None = None,
+) -> list[dict]:
     model.eval()
     text_tokenizer = CharTokenizer(config.text_vocab_size)
     time_tokenizer = NumericTokenizer(config.time_vocab, width=6)
     score_tokenizer = NumericTokenizer(config.score_vocab, width=3)
     predictions = []
-    for index in range(min(sample_count, len(dataset))):
+    total = len(dataset) if sample_limit is None else min(sample_limit, len(dataset))
+    for index in range(total):
         sample = dataset[index]
         frames = sample["frames"].unsqueeze(0).to(device)
         frame_times = sample["frame_times"].unsqueeze(0).to(device)
+        frame_mask = sample.get("frame_mask")
+        frame_mask = frame_mask.unsqueeze(0).to(device) if frame_mask is not None else None
         prompt_ids = sample["token_ids"][: sample["prompt_length"]].unsqueeze(0).to(device)
         patch_features = model.visual_encoder.extract_patch_features(frames)
         generated = model.generate(
@@ -193,6 +239,7 @@ def dump_predictions(
             frame_times,
             prompt_ids,
             max_new_tokens=config.max_generated_tokens,
+            frame_mask=frame_mask,
             visual_patch_features=patch_features,
         )
         predicted = decode_event_sequence(
@@ -205,10 +252,25 @@ def dump_predictions(
         predictions.append(
             {
                 "sample_index": index,
+                "source_id": sample.get("source_id"),
+                "video_path": sample.get("video_path"),
                 "ground_truth": sample["events"],
                 "predicted": predicted,
             }
         )
+    return predictions
+
+
+@torch.no_grad()
+def dump_predictions(
+    model: TinyTraceModel,
+    dataset: Dataset,
+    config: TinyTraceConfig,
+    device: torch.device,
+    path: Path,
+    sample_count: int,
+) -> None:
+    predictions = collect_predictions(model, dataset, config, device, sample_limit=sample_count)
     atomic_json(path, predictions)
 
 
@@ -216,6 +278,9 @@ def main() -> None:
     args = parse_args()
     if args.epochs < 1:
         raise ValueError("epochs must be at least 1.")
+    if not args.dataset_json and not args.allow_random_frames:
+        # Synthetic mode is always allowed when no dataset json is provided.
+        args.allow_random_frames = True
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
@@ -228,6 +293,11 @@ def main() -> None:
         config = TinyTraceConfig.from_dict(resume_payload["config"])
     else:
         config = TinyTraceConfig.from_json(args.config)
+
+    if args.dataset_json and not Path(args.dataset_json).is_file():
+        raise FileNotFoundError(f"Training dataset JSON not found: {args.dataset_json}")
+    if args.val_dataset_json and not Path(args.val_dataset_json).is_file():
+        raise FileNotFoundError(f"Validation dataset JSON not found: {args.val_dataset_json}")
 
     train_dataset = build_dataset(
         args.dataset_json,
@@ -270,11 +340,7 @@ def main() -> None:
     )
 
     model = TinyTraceModel(config, load_pretrained_visual=resume_payload is None).to(device)
-    optimizer = torch.optim.AdamW(
-        (parameter for parameter in model.parameters() if parameter.requires_grad),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+    optimizer = build_optimizer(model, args.lr, args.weight_decay)
     start_epoch = 1
     best_loss = float("inf")
     history: list[dict] = []
@@ -291,7 +357,9 @@ def main() -> None:
     prediction_dir = output_dir / "predictions"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     prediction_dir.mkdir(parents=True, exist_ok=True)
+    Path(args.frame_cache_dir).mkdir(parents=True, exist_ok=True)
     atomic_json(output_dir / "config.json", config.to_dict())
+    stage2_activated = False
 
     if start_epoch > args.epochs:
         raise ValueError(
@@ -299,9 +367,46 @@ def main() -> None:
         )
 
     for epoch in range(start_epoch, args.epochs + 1):
-        train_loss = run_epoch(model, train_loader, device, optimizer, args.gradient_clip)
+        if (
+            args.stage2_start_epoch > 0
+            and epoch >= args.stage2_start_epoch
+            and not stage2_activated
+        ):
+            model.set_visual_encoder_trainable(True, strategy=args.stage2_unfreeze_strategy)
+            optimizer = build_optimizer(
+                model,
+                args.lr,
+                args.weight_decay,
+                visual_lr_scale=args.stage2_visual_lr_scale,
+            )
+            stage2_activated = True
+            print(
+                f"stage2_enabled epoch={epoch} strategy={args.stage2_unfreeze_strategy} "
+                f"visual_lr_scale={args.stage2_visual_lr_scale}"
+            )
+        train_loss = run_epoch(
+            model,
+            train_loader,
+            device,
+            optimizer,
+            args.gradient_clip,
+            epoch=epoch,
+            log_every=args.log_every,
+            split="train",
+            max_steps_per_epoch=args.max_steps_per_epoch,
+        )
         val_loss = (
-            run_epoch(model, val_loader, device, optimizer=None, gradient_clip=0.0)
+            run_epoch(
+                model,
+                val_loader,
+                device,
+                optimizer=None,
+                gradient_clip=0.0,
+                epoch=epoch,
+                log_every=args.log_every,
+                split="val",
+                max_steps_per_epoch=args.max_steps_per_epoch,
+            )
             if val_loader is not None
             else None
         )
@@ -336,6 +441,16 @@ def main() -> None:
                 best_loss,
                 history,
             )
+            torch.save(
+                {
+                    "model_state": model.state_dict(),
+                    "config": config.to_dict(),
+                    "epoch": epoch,
+                    "best_loss": best_loss,
+                    "history": history,
+                },
+                output_dir / "tinytrace.pt",
+            )
         if args.save_every > 0 and epoch % args.save_every == 0:
             save_checkpoint(
                 checkpoint_dir / f"epoch-{epoch:04d}.pt",
@@ -356,6 +471,12 @@ def main() -> None:
                 prediction_dir / f"epoch-{epoch:04d}.json",
                 args.prediction_samples,
             )
+        if args.metrics_every > 0 and val_dataset is not None and epoch % args.metrics_every == 0:
+            metrics_predictions = collect_predictions(model, val_dataset, config, device, sample_limit=None)
+            metrics = evaluate_event_predictions(metrics_predictions)
+            atomic_json(output_dir / "metrics.json", metrics)
+            atomic_json(output_dir / f"metrics-epoch-{epoch:04d}.json", metrics)
+            print("metrics " + " ".join(f"{key}={value:.4f}" for key, value in metrics.items()))
 
 
 if __name__ == "__main__":

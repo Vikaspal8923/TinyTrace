@@ -7,7 +7,7 @@ from typing import Any
 @dataclass
 class TinyTraceConfig:
     image_size: int = 256
-    max_frames: int = 8
+    max_frames: int = 12
     visual_hidden_dim: int = 1024
     compressed_visual_tokens: int = 4
     time_tokens_per_frame: int = 6
@@ -16,6 +16,16 @@ class TinyTraceConfig:
     mobileclip_checkpoint: str = "checkpoints/mobileclip_s0.pt"
     mobileclip_checkpoint_sha256: str = "809b408eff74f8058843e86a1f92967097d42ba782450e85b8f4867b7f0ca0b7"
     freeze_visual_encoder: bool = True
+    mobileclip_image_mean: tuple[float, float, float] = (
+        0.48145466,
+        0.4578275,
+        0.40821073,
+    )
+    mobileclip_image_std: tuple[float, float, float] = (
+        0.26862954,
+        0.26130258,
+        0.27577711,
+    )
 
     d_model: int = 192
     num_layers: int = 4
@@ -73,7 +83,7 @@ class TinyTraceConfig:
             raise ValueError(f"Unknown TinyTrace config fields: {', '.join(unknown)}")
 
         normalized = dict(values)
-        for field_name in ("time_vocab", "score_vocab"):
+        for field_name in ("time_vocab", "score_vocab", "mobileclip_image_mean", "mobileclip_image_std"):
             if field_name in normalized:
                 normalized[field_name] = tuple(normalized[field_name])
         return cls(**normalized)

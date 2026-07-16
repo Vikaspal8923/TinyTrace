@@ -1,6 +1,6 @@
 {
   "image_size": 256,
-  "max_frames": 8,
+  "max_frames": 12,
   "visual_hidden_dim": 1024,
   "compressed_visual_tokens": 4,
   "mobileclip_model_name": "mobileclip_s0",

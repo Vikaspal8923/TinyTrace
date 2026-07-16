@@ -116,7 +116,84 @@ class JsonTinyTraceDataset(Dataset):
         payload = json.loads(self.annotation_path.read_text(encoding="utf-8"))
         if not isinstance(payload, list):
             raise ValueError("TinyTrace JSON dataset must be a list of samples.")
-        self.items = payload
+        self.items = self._filter_valid_items(payload)
+
+    def _filter_valid_items(self, payload: list[dict]) -> list[dict]:
+        valid_items = []
+        skipped_missing = 0
+        skipped_invalid = 0
+        for item in payload:
+            video_path = item.get("video_path")
+            if not video_path:
+                valid_items.append(item)
+                continue
+
+            source = Path(video_path)
+            if not source.is_file():
+                skipped_missing += 1
+                continue
+
+            duration = self._probe_video_duration(video_path)
+            if duration <= 0:
+                skipped_invalid += 1
+                continue
+
+            max_event_time = 0.0
+            for event in item.get("events", []):
+                timestamp = event.get("timestamp", [])
+                if isinstance(timestamp, list) and timestamp:
+                    max_event_time = max(max_event_time, max(float(value) for value in timestamp))
+
+            if max_event_time > duration + 0.5:
+                skipped_invalid += 1
+                continue
+            valid_items.append(item)
+
+        if not valid_items:
+            raise ValueError(
+                "No valid TinyTrace samples remain after video validation. "
+                "Check downloaded clips and annotation paths."
+            )
+
+        if skipped_missing or skipped_invalid:
+            print(
+                "JsonTinyTraceDataset filtered invalid samples: "
+                f"kept={len(valid_items)} skipped_missing={skipped_missing} skipped_invalid={skipped_invalid}"
+            )
+        return valid_items
+
+    @staticmethod
+    def _probe_video_duration(video_path: str) -> float:
+        probe = subprocess.check_output(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=duration:format=duration",
+                "-of",
+                "json",
+                video_path,
+            ],
+            text=True,
+        )
+        payload = json.loads(probe)
+        candidates = []
+        for stream in payload.get("streams", []):
+            value = stream.get("duration")
+            if value not in (None, "N/A", ""):
+                try:
+                    candidates.append(float(value))
+                except ValueError:
+                    pass
+        format_value = payload.get("format", {}).get("duration")
+        if format_value not in (None, "N/A", ""):
+            try:
+                candidates.append(float(format_value))
+            except ValueError:
+                pass
+        positive = [value for value in candidates if value > 0]
+        return min(positive) if positive else 0.0
 
     def _convert_sample(self, item: dict) -> dict:
         num_frames = int(item.get("num_frames", self.config.max_frames))
@@ -189,21 +266,7 @@ class JsonTinyTraceDataset(Dataset):
         return frames, frame_times
 
     def _load_video_frames(self, video_path: str, num_frames: int) -> tuple[torch.Tensor, torch.Tensor]:
-        duration = float(
-            subprocess.check_output(
-                [
-                    "ffprobe",
-                    "-v",
-                    "error",
-                    "-show_entries",
-                    "format=duration",
-                    "-of",
-                    "default=noprint_wrappers=1:nokey=1",
-                    video_path,
-                ],
-                text=True,
-            ).strip()
-        )
+        duration = self._probe_video_duration(video_path)
         if duration <= 0:
             raise ValueError(f"Invalid video duration: {video_path}")
 

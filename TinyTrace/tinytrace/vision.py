@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
+import importlib.metadata as importlib_metadata
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
@@ -9,6 +12,41 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as vision_transforms
 
 from .config import TinyTraceConfig
+
+
+@contextmanager
+def _patch_package_metadata_versions():
+    """Work around broken dist-info metadata in ad-hoc student envs.
+
+    Some local venvs report ``importlib.metadata.version(...)`` as ``None``
+    even though the module imports and exposes ``__version__`` correctly.
+    The MobileCLIP import path pulls in transformers via open_clip, and that
+    code expects a real version string. We patch only the import window needed
+    to construct the backbone.
+    """
+
+    original_version = importlib_metadata.version
+    module_fallbacks = {
+        "torch": "torch",
+        "numpy": "numpy",
+        "pillow": "PIL",
+        "Pillow": "PIL",
+    }
+
+    def patched_version(name: str) -> str:
+        version = original_version(name)
+        if version is None and name in module_fallbacks:
+            module = importlib.import_module(module_fallbacks[name])
+            fallback_version = getattr(module, "__version__", None)
+            if fallback_version is not None:
+                return str(fallback_version)
+        return version
+
+    importlib_metadata.version = patched_version
+    try:
+        yield
+    finally:
+        importlib_metadata.version = original_version
 
 
 class MobileCLIPSpatialEncoder(nn.Module):
@@ -29,13 +67,12 @@ class MobileCLIPSpatialEncoder(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.trainable_strategy = "frozen"
         self.backbone = (
             backbone if backbone is not None else self._load_official_backbone(load_pretrained=load_pretrained)
         )
 
-        if config.freeze_visual_encoder:
-            self.backbone.requires_grad_(False)
-        self.backbone.eval()
+        self.set_trainable(not config.freeze_visual_encoder)
 
     def _load_official_backbone(self, load_pretrained: bool) -> nn.Module:
         checkpoint = Path(self.config.mobileclip_checkpoint)
@@ -60,27 +97,50 @@ class MobileCLIPSpatialEncoder(nn.Module):
                 )
 
         try:
-            import mobileclip
+            with _patch_package_metadata_versions():
+                import mobileclip
+
+                clip_model, _, _ = mobileclip.create_model_and_transforms(
+                    self.config.mobileclip_model_name,
+                    pretrained=str(checkpoint) if load_pretrained else None,
+                    reparameterize=False,
+                )
         except ImportError as exc:
             raise ImportError(
                 "The official Apple MobileCLIP package is required. Install "
                 "apple/ml-mobileclip before constructing TinyTraceModel."
             ) from exc
-
-        clip_model, _, _ = mobileclip.create_model_and_transforms(
-            self.config.mobileclip_model_name,
-            pretrained=str(checkpoint) if load_pretrained else None,
-            reparameterize=False,
-        )
         return clip_model.image_encoder.model
 
     def train(self, mode: bool = True) -> "MobileCLIPSpatialEncoder":
         super().train(mode)
         # MobileCLIP-S0 contains BatchNorm layers and must stay in evaluation
         # mode while frozen, even when the surrounding TinyTrace model trains.
-        if self.config.freeze_visual_encoder:
+        if self.trainable_strategy == "frozen":
             self.backbone.eval()
+        elif self.trainable_strategy == "conv_exp":
+            self.backbone.eval()
+            self.backbone.conv_exp.train(mode)
         return self
+
+    def set_trainable(self, trainable: bool, strategy: str = "full") -> None:
+        if not trainable:
+            self.trainable_strategy = "frozen"
+            self.backbone.requires_grad_(False)
+            self.backbone.eval()
+            return
+
+        if strategy not in {"full", "conv_exp"}:
+            raise ValueError(f"Unsupported MobileCLIP trainable strategy: {strategy}")
+        self.trainable_strategy = strategy
+        self.backbone.requires_grad_(False)
+        if strategy == "full":
+            self.backbone.requires_grad_(True)
+            self.backbone.train()
+        else:
+            self.backbone.conv_exp.requires_grad_(True)
+            self.backbone.eval()
+            self.backbone.conv_exp.train()
 
     def preprocess(self, frames: torch.Tensor) -> torch.Tensor:
         if frames.ndim != 4 or frames.size(1) != 3:
@@ -92,10 +152,25 @@ class MobileCLIPSpatialEncoder(nn.Module):
             interpolation=InterpolationMode.BILINEAR,
             antialias=True,
         )
-        return vision_transforms.center_crop(
+        frames = vision_transforms.center_crop(
             frames,
             output_size=[self.config.image_size, self.config.image_size],
         )
+        return self._normalize(
+            frames,
+            self.config.mobileclip_image_mean,
+            self.config.mobileclip_image_std,
+        )
+
+    @staticmethod
+    def _normalize(
+        frames: torch.Tensor,
+        mean: tuple[float, float, float],
+        std: tuple[float, float, float],
+    ) -> torch.Tensor:
+        mean_tensor = torch.tensor(mean, dtype=frames.dtype, device=frames.device).view(1, 3, 1, 1)
+        std_tensor = torch.tensor(std, dtype=frames.dtype, device=frames.device).view(1, 3, 1, 1)
+        return (frames - mean_tensor) / std_tensor
 
     def forward(self, frames: torch.Tensor) -> torch.Tensor:
         frames = self.preprocess(frames)

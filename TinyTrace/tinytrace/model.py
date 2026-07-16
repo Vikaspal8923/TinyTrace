@@ -45,6 +45,9 @@ class LightweightVisualEncoder(nn.Module):
         )
         self.config = config
 
+    def set_mobileclip_trainable(self, trainable: bool, strategy: str = "full") -> None:
+        self.mobileclip.set_trainable(trainable, strategy=strategy)
+
     def extract_patch_features(self, frames: torch.Tensor) -> torch.Tensor:
         batch, num_frames, channels, height, width = frames.shape
         patches = self.mobileclip(frames.reshape(batch * num_frames, channels, height, width))
@@ -140,6 +143,7 @@ class TinyTraceModel(nn.Module):
         self.sync_embedding = nn.Parameter(torch.randn(config.d_model))
         self.time_embeddings = nn.Embedding(len(config.time_vocab), config.d_model)
         self.score_embeddings = nn.Embedding(len(config.score_vocab), config.d_model)
+        self.token_type_embeddings = nn.Embedding(4, config.d_model)
         self.position = PositionalEncoding(config.d_model)
         self.dropout = nn.Dropout(config.dropout)
         self.blocks = nn.ModuleList([DecoderBlock(config) for _ in range(config.num_layers)])
@@ -148,6 +152,9 @@ class TinyTraceModel(nn.Module):
         self.text_head = nn.Linear(config.d_model, config.text_vocab_size + 1)
         self.time_head = nn.Linear(config.d_model, len(config.time_vocab))
         self.score_head = nn.Linear(config.d_model, len(config.score_vocab))
+
+    def set_visual_encoder_trainable(self, trainable: bool, strategy: str = "full") -> None:
+        self.visual_encoder.set_mobileclip_trainable(trainable, strategy=strategy)
 
     def _encode_frame_time_ids(self, frame_times: torch.Tensor) -> torch.Tensor:
         if frame_times.ndim != 2:
@@ -246,19 +253,66 @@ class TinyTraceModel(nn.Module):
 
         return allowed
 
+    def _infer_token_type_ids(self, token_ids: torch.Tensor) -> torch.Tensor:
+        token_types = torch.zeros_like(token_ids)
+        token_types[token_ids == self.config.sync_token_id] = 3
+        token_types[(token_ids >= self.config.time_token_base) & (token_ids < self.config.score_token_base)] = 1
+        token_types[token_ids >= self.config.score_token_base] = 2
+        return token_types
+
+    def _decode_numeric_values(self, ids: list[int], vocab: tuple[str, ...]) -> list[float]:
+        id_to_token = {index: token for index, token in enumerate(vocab)}
+        values: list[float] = []
+        current: list[str] = []
+        for idx in ids:
+            token = id_to_token[idx]
+            if token == "<sep>":
+                if current:
+                    values.append(float("".join(current)))
+                    current = []
+            elif token != "<sync>":
+                current.append(token)
+        if current:
+            values.append(float("".join(current)))
+        return values
+
+    def _encode_numeric_values(self, values: list[float], mode: str) -> list[int]:
+        width = 6 if mode == "time" else 3
+        vocab = self.config.time_vocab if mode == "time" else self.config.score_vocab
+        token_to_id = {token: index for index, token in enumerate(vocab)}
+        encoded: list[int] = []
+        for index, value in enumerate(values):
+            for char in format(float(value), f"0>{width}.1f"):
+                encoded.append(token_to_id[char])
+            if index < len(values) - 1:
+                encoded.append(token_to_id["<sep>"])
+        encoded.append(token_to_id["<sync>"])
+        return encoded
+
+    def _constrain_time_ids(self, time_ids: list[int], clip_end: float) -> list[int]:
+        values = self._decode_numeric_values(time_ids, self.config.time_vocab)
+        if not values:
+            return time_ids
+        clipped = [min(max(value, 0.0), clip_end) for value in values]
+        if len(clipped) >= 2:
+            clipped[1] = max(clipped[0], clipped[1])
+        return self._encode_numeric_values(clipped[: self.config.timestamp_value_count], mode="time")
+
     def embed_mixed_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
+        token_type_ids = self._infer_token_type_ids(token_ids)
         embeddings = []
-        for row in token_ids:
+        for row, type_row in zip(token_ids, token_type_ids):
             row_embeddings = []
-            for token_id in row.tolist():
+            for token_id, token_type in zip(row.tolist(), type_row.tolist()):
                 if token_id == self.config.sync_token_id:
-                    row_embeddings.append(self.sync_embedding)
+                    base_embedding = self.sync_embedding
                 elif token_id >= self.config.score_token_base:
-                    row_embeddings.append(self.score_embeddings.weight[token_id - self.config.score_token_base])
+                    base_embedding = self.score_embeddings.weight[token_id - self.config.score_token_base]
                 elif token_id >= self.config.time_token_base:
-                    row_embeddings.append(self.time_embeddings.weight[token_id - self.config.time_token_base])
+                    base_embedding = self.time_embeddings.weight[token_id - self.config.time_token_base]
                 else:
-                    row_embeddings.append(self.text_embeddings.weight[token_id])
+                    base_embedding = self.text_embeddings.weight[token_id]
+                row_embeddings.append(base_embedding + self.token_type_embeddings.weight[token_type])
             embeddings.append(torch.stack(row_embeddings, dim=0))
         return torch.stack(embeddings, dim=0)
 
@@ -391,6 +445,8 @@ class TinyTraceModel(nn.Module):
         mode = "time"
         phase_token_count = 0
         event_count = 0
+        phase_start_index = generated.size(1)
+        clip_end = float(frame_times.max().item())
         min_time_tokens, min_score_tokens = self._expected_phase_lengths()
         for _ in range(max_new_tokens):
             output = self.forward(
@@ -433,6 +489,7 @@ class TinyTraceModel(nn.Module):
                 generated = torch.cat([generated, next_token], dim=1)
                 if next_token[0, 0].item() == self.config.eos_token_id:
                     break
+                phase_start_index = generated.size(1) - 1
                 continue
 
             if mode == "time":
@@ -483,6 +540,25 @@ class TinyTraceModel(nn.Module):
             token_value = next_token[0, 0].item()
             if token_value == self.config.sync_token_id:
                 if mode == "time":
+                    time_phase = generated[0, phase_start_index:].tolist()
+                    constrained = self._constrain_time_ids(
+                        [
+                            0 if token == self.config.sync_token_id else token - self.config.time_token_base
+                            for token in time_phase
+                        ],
+                        clip_end=clip_end,
+                    )
+                    constrained_tokens = [
+                        self.config.sync_token_id if token == 0 else token + self.config.time_token_base
+                        for token in constrained
+                    ]
+                    generated = torch.cat(
+                        [
+                            generated[:, :phase_start_index],
+                            torch.tensor(constrained_tokens, dtype=generated.dtype, device=generated.device).unsqueeze(0),
+                        ],
+                        dim=1,
+                    )
                     mode = "score"
                 elif mode == "score":
                     mode = "caption"
@@ -490,6 +566,7 @@ class TinyTraceModel(nn.Module):
                     event_count += 1
                     mode = "boundary"
                 phase_token_count = 0
+                phase_start_index = generated.size(1)
             elif token_value == self.config.eos_token_id:
                 break
             else:
