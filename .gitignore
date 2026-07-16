@@ -7,6 +7,7 @@ dataset/*
 dataset/qvhighlights/*
 !dataset/qvhighlights/mt_fmt-50-valid.json
 qvhighlights/
+final_qvhighlights_tinytrace/
 
 # Python caches and environments
 __pycache__/

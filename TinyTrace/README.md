@@ -233,7 +233,7 @@ PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python TinyTrace/scripts/train_tinytrac
 The final cleaned dataset prepared for TinyTrace is stored here:
 
 ```bash
-dataset/final_qvhighlights_tinytrace/
+final_qvhighlights_tinytrace/
 ```
 
 It contains:
@@ -247,7 +247,7 @@ It contains:
 You do not need to move this folder anywhere else. Keep it exactly under:
 
 ```bash
-dataset/final_qvhighlights_tinytrace/
+final_qvhighlights_tinytrace/
 ```
 
 and run training from the project root:
@@ -255,7 +255,7 @@ and run training from the project root:
 ```bash
 cd /home/vikaspal/Desktop/Traceall
 PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python TinyTrace/scripts/train_tinytrace.py \
-  --dataset-json dataset/final_qvhighlights_tinytrace/annotations/tinytrace_train.json \
+  --dataset-json final_qvhighlights_tinytrace/annotations/tinytrace_train.json \
   --epochs 10 \
   --batch-size 2 \
   --output-dir TinyTrace/outputs-qvh-final
@@ -266,8 +266,8 @@ To inspect one validation sample after training:
 ```bash
 cd /home/vikaspal/Desktop/Traceall
 PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python TinyTrace/scripts/eval_tinytrace.py \
-  --checkpoint TinyTrace/outputs-qvh-final/checkpoints/best.pt \
-  --dataset-json dataset/final_qvhighlights_tinytrace/annotations/tinytrace_val.json \
+  --checkpoint TinyTrace/outputs-qvh-final/tinytrace.pt \
+  --dataset-json final_qvhighlights_tinytrace/annotations/tinytrace_val.json \
   --sample-index 0
 ```
 
@@ -276,9 +276,9 @@ To run TRACE-style highlight metrics on the validation split:
 ```bash
 cd /home/vikaspal/Desktop/Traceall
 PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python TinyTrace/scripts/eval_tinytrace_vhd.py \
-  --checkpoint TinyTrace/outputs-qvh-final/checkpoints/best.pt \
-  --dataset-json dataset/final_qvhighlights_tinytrace/annotations/tinytrace_val.json \
-  --source-json dataset/final_qvhighlights_tinytrace/annotations/qvh_raw_valid_500.json \
+  --checkpoint TinyTrace/outputs-qvh-final/tinytrace.pt \
+  --dataset-json final_qvhighlights_tinytrace/annotations/tinytrace_val.json \
+  --source-json final_qvhighlights_tinytrace/annotations/qvh_raw_valid_500.json \
   --save-path TinyTrace/outputs-qvh-final/qvh_val_metrics.json
 ```
 
