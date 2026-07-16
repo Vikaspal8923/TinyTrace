@@ -14,6 +14,7 @@ class TinyTraceConfig:
 
     mobileclip_model_name: str = "mobileclip_s0"
     mobileclip_checkpoint: str = "checkpoints/mobileclip_s0.pt"
+    mobileclip_checkpoint_sha256: str = "809b408eff74f8058843e86a1f92967097d42ba782450e85b8f4867b7f0ca0b7"
     freeze_visual_encoder: bool = True
 
     d_model: int = 192

@@ -35,6 +35,16 @@ class MobileCLIPSpatialEncoderTests(unittest.TestCase):
         self.assertEqual(tokens.shape, (2, 64, 1024))
         self.assertTrue(all(not parameter.requires_grad for parameter in backbone.parameters()))
 
+    def test_preprocess_preserves_aspect_then_center_crops_without_normalization(self) -> None:
+        config = TinyTraceConfig(image_size=32)
+        encoder = MobileCLIPSpatialEncoder(config, backbone=FakeMobileCLIPBackbone())
+        frames = torch.ones(1, 3, 20, 40)
+
+        processed = encoder.preprocess(frames)
+
+        self.assertEqual(processed.shape, (1, 3, 32, 32))
+        self.assertTrue(torch.equal(processed, torch.ones_like(processed)))
+
     def test_frozen_backbone_stays_in_eval_mode(self) -> None:
         encoder = MobileCLIPSpatialEncoder(TinyTraceConfig(), backbone=FakeMobileCLIPBackbone())
 

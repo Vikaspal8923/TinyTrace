@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as vision_transforms
 
 from .config import TinyTraceConfig
 
@@ -45,6 +47,17 @@ class MobileCLIPSpatialEncoder(nn.Module):
                 f"{checkpoint}. Download the official checkpoint and set "
                 "mobileclip_checkpoint in the TinyTrace config."
             )
+        if load_pretrained and self.config.mobileclip_checkpoint_sha256:
+            digest = hashlib.sha256()
+            with checkpoint.open("rb") as checkpoint_file:
+                for chunk in iter(lambda: checkpoint_file.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            actual_sha256 = digest.hexdigest()
+            if actual_sha256 != self.config.mobileclip_checkpoint_sha256.lower():
+                raise ValueError(
+                    "MobileCLIP checkpoint SHA-256 mismatch: expected "
+                    f"{self.config.mobileclip_checkpoint_sha256}, received {actual_sha256}."
+                )
 
         try:
             import mobileclip
@@ -73,12 +86,15 @@ class MobileCLIPSpatialEncoder(nn.Module):
         if frames.ndim != 4 or frames.size(1) != 3:
             raise ValueError("MobileCLIP frames must have shape [batch, 3, height, width].")
         frames = frames.float().clamp(0.0, 1.0)
-        return F.interpolate(
+        frames = vision_transforms.resize(
             frames,
-            size=(self.config.image_size, self.config.image_size),
-            mode="bilinear",
-            align_corners=False,
+            size=self.config.image_size,
+            interpolation=InterpolationMode.BILINEAR,
             antialias=True,
+        )
+        return vision_transforms.center_crop(
+            frames,
+            output_size=[self.config.image_size, self.config.image_size],
         )
 
     def forward(self, frames: torch.Tensor) -> torch.Tensor:

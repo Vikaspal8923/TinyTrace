@@ -88,10 +88,11 @@ Make the implementation match the frozen TinyTrace architecture.
 - replace the custom conv visual encoder with MobileCLIP-S0
 - keep MobileCLIP fully standalone inside TinyTrace
 - freeze MobileCLIP parameters
-- force frozen normalization behavior correctly during training
+- keep frozen BatchNorm behavior in evaluation mode during training
 - implement official preprocessing:
-  - resize
-  - normalization
+  - bilinear resize preserving aspect ratio
+  - center crop
+  - `[0, 1]` tensor range (the official Apple v1 S0 transform has no mean/std normalization)
   - tensor shape expectations
 - expose spatial features before global pooling
 - adapt MobileCLIP output into TinyTrace visual token flow
@@ -147,6 +148,9 @@ Make the system reliable and maintainable.
 - add padding and masking for variable-length videos
 - clean duplicate logic between training, eval, and parser paths
 - verify dependency list is complete
+- decode JSON video samples lazily and cache decoded frames safely
+- verify the MobileCLIP checkpoint checksum and pin the package revision
+- add validation, resume, periodic checkpointing, loss history, and prediction snapshots
 
 ### Deliverable
 
@@ -154,10 +158,13 @@ Make the system reliable and maintainable.
 
 ### Status
 
-- `partial`
+- `completed` for the supported single-sample generation contract
 
 Notes:
 - config restoration, shared serialization, defensive parsing, dependencies, and variable-frame masking are implemented
+- JSON construction is metadata-only; video decoding occurs in `__getitem__` and supports an atomic persistent frame cache
+- MobileCLIP setup is pinned and the official checkpoint is checksum-verified
+- training supports validation, best/latest/periodic checkpoints, resume, history, and prediction snapshots
 - batched generation still requires independent per-sequence head-switching state
 
 ## Phase 3 — Tests Integrated With Development

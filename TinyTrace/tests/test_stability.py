@@ -1,9 +1,12 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 import torch
 
 from tinytrace.config import TinyTraceConfig
-from tinytrace.data import SyntheticTinyTraceDataset, tinytrace_collate_fn
+from tinytrace.data import JsonTinyTraceDataset, SyntheticTinyTraceDataset, tinytrace_collate_fn
 from tinytrace.model import TinyTraceModel
 from tinytrace.tokenizers import NumericTokenizer
 
@@ -11,6 +14,60 @@ from test_vision import FakeMobileCLIPBackbone
 
 
 class StabilityTests(unittest.TestCase):
+    def test_json_dataset_decodes_lazily_and_reuses_frame_cache(self) -> None:
+        class CountingDataset(JsonTinyTraceDataset):
+            decode_calls = 0
+
+            def _load_video_frames(self, video_path: str, num_frames: int):
+                self.decode_calls += 1
+                return (
+                    torch.ones(num_frames, 3, self.config.image_size, self.config.image_size),
+                    torch.arange(num_frames, dtype=torch.float32),
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            annotations = root / "samples.json"
+            annotations.write_text(
+                json.dumps(
+                    [
+                        {
+                            "video_path": str(root / "video.mp4"),
+                            "num_frames": 2,
+                            "events": [],
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            dataset = CountingDataset(
+                annotations,
+                TinyTraceConfig(image_size=16, max_frames=2),
+                frame_cache_dir=root / "cache",
+                allow_random_frames=False,
+            )
+
+            self.assertEqual(dataset.decode_calls, 0)
+            first = dataset[0]
+            self.assertEqual(dataset.decode_calls, 1)
+            second = dataset[0]
+            self.assertEqual(dataset.decode_calls, 1)
+            self.assertTrue(torch.equal(first["frames"], second["frames"]))
+            self.assertEqual(len(list((root / "cache").glob("*.pt"))), 1)
+
+    def test_real_json_dataset_rejects_missing_media(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            annotations = Path(directory) / "samples.json"
+            annotations.write_text(json.dumps([{"events": []}]), encoding="utf-8")
+            dataset = JsonTinyTraceDataset(
+                annotations,
+                TinyTraceConfig(image_size=16, max_frames=1),
+                allow_random_frames=False,
+            )
+
+            with self.assertRaisesRegex(ValueError, "random fallback frames are disabled"):
+                dataset[0]
+
     def test_numeric_tokenizer_round_trip(self) -> None:
         config = TinyTraceConfig()
         tokenizer = NumericTokenizer(config.time_vocab, width=6)

@@ -25,13 +25,16 @@ TinyTrace is currently an architecture-aligned prototype:
 - each frame contributes TRACE-style fixed-width discrete time embeddings
 - the LCEM prefix is ordered as per-frame visual slots + time tokens, followed by instruction/event tokens
 - variable-length frame batches are padded and attention-masked
+- real-video frames are decoded lazily and can be cached across epochs
+- checkpoints include optimizer/config/history state and support resume
+- training supports validation, best/latest checkpoints, and prediction snapshots
 - focused architecture tests pass
 
 It is not yet a final trained model. Tiny-subset overfitting and staged training
 must be validated before scaling the real-video dataset.
 
-The MobileCLIP checkpoint is intentionally not committed. Place Apple's
-official `mobileclip_s0.pt` at `TinyTrace/checkpoints/mobileclip_s0.pt`.
+The MobileCLIP checkpoint is intentionally not committed. The setup helper
+downloads Apple's official `mobileclip_s0.pt` and verifies its SHA-256 digest.
 
 ## Project Structure
 
@@ -58,6 +61,7 @@ On Windows PowerShell:
 ```powershell
 python -m venv TinyTrace/.venv
 TinyTrace/.venv/Scripts/python.exe -m pip install -r TinyTrace/requirements.txt
+TinyTrace/.venv/Scripts/python.exe TinyTrace/scripts/setup_mobileclip.py
 ```
 
 Run the focused tests before training:
@@ -82,7 +86,8 @@ PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python TinyTrace/scripts/eval_tinytrace
 
 ```bash
 PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python TinyTrace/scripts/train_tinytrace.py \
-  --dataset-json TinyTrace/data/sample_dataset.json
+  --dataset-json TinyTrace/data/sample_dataset.json \
+  --frame-cache-dir TinyTrace/.cache/frames
 
 PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python TinyTrace/scripts/eval_tinytrace.py \
   --dataset-json TinyTrace/data/sample_dataset.json
@@ -191,10 +196,27 @@ This script:
 ```bash
 PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python TinyTrace/scripts/train_tinytrace.py \
   --dataset-json TinyTrace/data/qvh_tinytrace_subset.json \
+  --val-dataset-json TinyTrace/data/qvh_tinytrace_val.json \
   --epochs 10 \
   --batch-size 2 \
   --output-dir TinyTrace/outputs-qvh
 ```
+
+Real-data training does not silently substitute random frames. Use
+`--allow-random-frames` only for deliberate debugging. Resume a stopped run by
+setting the total target epoch and loading `latest.pt`:
+
+```bash
+PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python TinyTrace/scripts/train_tinytrace.py \
+  --dataset-json TinyTrace/data/qvh_tinytrace_subset.json \
+  --val-dataset-json TinyTrace/data/qvh_tinytrace_val.json \
+  --epochs 20 \
+  --resume TinyTrace/outputs-qvh/checkpoints/latest.pt \
+  --output-dir TinyTrace/outputs-qvh
+```
+
+Each run writes `config.json`, `history.json`, `checkpoints/latest.pt`,
+`checkpoints/best.pt`, periodic checkpoints, and epoch prediction JSON files.
 
 For a quick smoke run:
 
@@ -244,7 +266,7 @@ To inspect one validation sample after training:
 ```bash
 cd /home/vikaspal/Desktop/Traceall
 PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python TinyTrace/scripts/eval_tinytrace.py \
-  --checkpoint TinyTrace/outputs-qvh-final/tinytrace.pt \
+  --checkpoint TinyTrace/outputs-qvh-final/checkpoints/best.pt \
   --dataset-json dataset/final_qvhighlights_tinytrace/annotations/tinytrace_val.json \
   --sample-index 0
 ```
@@ -254,7 +276,7 @@ To run TRACE-style highlight metrics on the validation split:
 ```bash
 cd /home/vikaspal/Desktop/Traceall
 PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python TinyTrace/scripts/eval_tinytrace_vhd.py \
-  --checkpoint TinyTrace/outputs-qvh-final/tinytrace.pt \
+  --checkpoint TinyTrace/outputs-qvh-final/checkpoints/best.pt \
   --dataset-json dataset/final_qvhighlights_tinytrace/annotations/tinytrace_val.json \
   --source-json dataset/final_qvhighlights_tinytrace/annotations/qvh_raw_valid_500.json \
   --save-path TinyTrace/outputs-qvh-final/qvh_val_metrics.json
@@ -266,7 +288,7 @@ To inspect what TinyTrace currently predicts for one video:
 
 ```bash
 PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python TinyTrace/scripts/eval_tinytrace.py \
-  --checkpoint TinyTrace/outputs-qvh-smoke/tinytrace.pt \
+  --checkpoint TinyTrace/outputs-qvh-smoke/checkpoints/best.pt \
   --dataset-json TinyTrace/data/qvh_tinytrace_subset.json \
   --sample-index 0
 ```
@@ -293,7 +315,7 @@ Run:
 
 ```bash
 PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python TinyTrace/scripts/eval_tinytrace_vhd.py \
-  --checkpoint TinyTrace/outputs-qvh-smoke/tinytrace.pt \
+  --checkpoint TinyTrace/outputs-qvh-smoke/checkpoints/best.pt \
   --dataset-json TinyTrace/data/qvh_tinytrace_subset.json \
   --source-json dataset/mt_fmt-8k.json \
   --save-path TinyTrace/outputs-qvh-smoke/qvh_metrics.json

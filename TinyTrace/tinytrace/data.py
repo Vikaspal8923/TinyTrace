@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import random
 import re
 import subprocess
+import uuid
 from pathlib import Path
 
 import torch
@@ -96,17 +98,25 @@ class SyntheticTinyTraceDataset(Dataset):
 
 
 class JsonTinyTraceDataset(Dataset):
-    def __init__(self, annotation_path: str | Path, config: TinyTraceConfig) -> None:
+    def __init__(
+        self,
+        annotation_path: str | Path,
+        config: TinyTraceConfig,
+        frame_cache_dir: str | Path | None = None,
+        allow_random_frames: bool = True,
+    ) -> None:
         self.annotation_path = Path(annotation_path)
         self.config = config
+        self.frame_cache_dir = Path(frame_cache_dir) if frame_cache_dir else None
+        self.allow_random_frames = allow_random_frames
         self.text_tokenizer = CharTokenizer(config.text_vocab_size)
         self.time_tokenizer = NumericTokenizer(config.time_vocab, width=6)
         self.score_tokenizer = NumericTokenizer(config.score_vocab, width=3)
 
-        payload = json.loads(self.annotation_path.read_text())
+        payload = json.loads(self.annotation_path.read_text(encoding="utf-8"))
         if not isinstance(payload, list):
             raise ValueError("TinyTrace JSON dataset must be a list of samples.")
-        self.samples = [self._convert_sample(item) for item in payload]
+        self.items = payload
 
     def _convert_sample(self, item: dict) -> dict:
         num_frames = int(item.get("num_frames", self.config.max_frames))
@@ -114,13 +124,18 @@ class JsonTinyTraceDataset(Dataset):
         width = int(item.get("image_size", self.config.image_size))
 
         if "video_path" in item:
-            frames, frame_times_tensor = self._load_video_frames(item["video_path"], num_frames)
+            frames, frame_times_tensor = self._load_video_frames_cached(item["video_path"], num_frames)
         elif "frames_path" in item:
-            frames = torch.load(item["frames_path"]).float()
+            frames = torch.load(item["frames_path"], map_location="cpu", weights_only=True).float()
             frame_times_tensor = torch.linspace(0.0, float(num_frames - 1), steps=num_frames)
-        else:
+        elif self.allow_random_frames:
             frames = torch.rand(num_frames, 3, height, width)
             frame_times_tensor = torch.linspace(0.0, float(num_frames - 1), steps=num_frames)
+        else:
+            raise ValueError(
+                "Real-data sample must define video_path or frames_path; "
+                "random fallback frames are disabled."
+            )
 
         instruction = item.get("instruction", "localize events and describe them")
         events = item.get("events", [])
@@ -137,6 +152,41 @@ class JsonTinyTraceDataset(Dataset):
             "label_types": torch.tensor(label_types, dtype=torch.long),
             "prompt_length": prompt_length,
         }
+
+    def _load_video_frames_cached(
+        self,
+        video_path: str,
+        num_frames: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.frame_cache_dir is None:
+            return self._load_video_frames(video_path, num_frames)
+
+        source = Path(video_path)
+        stat = source.stat() if source.exists() else None
+        identity = "|".join(
+            [
+                str(source.resolve()),
+                str(stat.st_size if stat else "missing"),
+                str(stat.st_mtime_ns if stat else "missing"),
+                str(num_frames),
+                str(self.config.image_size),
+            ]
+        )
+        cache_key = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        cache_path = self.frame_cache_dir / f"{cache_key}.pt"
+        if cache_path.is_file():
+            cached = torch.load(cache_path, map_location="cpu", weights_only=True)
+            return cached["frames"], cached["frame_times"]
+
+        frames, frame_times = self._load_video_frames(video_path, num_frames)
+        self.frame_cache_dir.mkdir(parents=True, exist_ok=True)
+        temporary_path = cache_path.with_name(f"{cache_path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            torch.save({"frames": frames, "frame_times": frame_times}, temporary_path)
+            temporary_path.replace(cache_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+        return frames, frame_times
 
     def _load_video_frames(self, video_path: str, num_frames: int) -> tuple[torch.Tensor, torch.Tensor]:
         duration = float(
@@ -208,10 +258,10 @@ class JsonTinyTraceDataset(Dataset):
         )
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.items)
 
     def __getitem__(self, index: int) -> dict:
-        return self.samples[index]
+        return self._convert_sample(self.items[index])
 
 
 def tinytrace_collate_fn(batch: list[dict]) -> dict:

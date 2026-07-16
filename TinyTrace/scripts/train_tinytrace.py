@@ -2,82 +2,360 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
+import sys
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
-from tinytrace import JsonTinyTraceDataset, SyntheticTinyTraceDataset, TinyTraceConfig, TinyTraceModel, tinytrace_collate_fn
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from tinytrace import (
+    JsonTinyTraceDataset,
+    SyntheticTinyTraceDataset,
+    TinyTraceConfig,
+    TinyTraceModel,
+    decode_event_sequence,
+    tinytrace_collate_fn,
+)
+from tinytrace.tokenizers import CharTokenizer, NumericTokenizer
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Train TinyTrace with reproducible artifacts.")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--gradient-clip", type=float, default=1.0)
     parser.add_argument("--dataset-size", type=int, default=128)
     parser.add_argument("--dataset-json", type=str, default="")
-    parser.add_argument("--config", type=str, default="TinyTrace/configs/tinytrace_baseline.json")
-    parser.add_argument("--output-dir", type=str, default="TinyTrace/outputs")
+    parser.add_argument("--val-dataset-json", type=str, default="")
+    parser.add_argument("--config", type=str, default=str(PROJECT_ROOT / "configs/tinytrace_baseline.json"))
+    parser.add_argument("--output-dir", type=str, default=str(PROJECT_ROOT / "outputs"))
+    parser.add_argument("--frame-cache-dir", type=str, default=str(PROJECT_ROOT / ".cache/frames"))
+    parser.add_argument("--allow-random-frames", action="store_true")
+    parser.add_argument("--resume", type=str, default="")
+    parser.add_argument("--save-every", type=int, default=5)
+    parser.add_argument("--prediction-every", type=int, default=1)
+    parser.add_argument("--prediction-samples", type=int, default=2)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", type=str, default="cpu")
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-    device = torch.device(args.device)
+def build_dataset(
+    annotation_path: str,
+    config: TinyTraceConfig,
+    frame_cache_dir: str,
+    allow_random_frames: bool,
+    synthetic_size: int | None = None,
+    seed: int = 7,
+) -> Dataset:
+    if annotation_path:
+        return JsonTinyTraceDataset(
+            annotation_path,
+            config=config,
+            frame_cache_dir=frame_cache_dir,
+            allow_random_frames=allow_random_frames,
+        )
+    if synthetic_size is None:
+        raise ValueError("A validation dataset path is required for real-data validation.")
+    return SyntheticTinyTraceDataset(config=config, size=synthetic_size, seed=seed)
 
-    config = TinyTraceConfig.from_json(args.config)
-    dataset = (
-        JsonTinyTraceDataset(args.dataset_json, config=config)
-        if args.dataset_json
-        else SyntheticTinyTraceDataset(config=config, size=args.dataset_size)
+
+def build_loader(
+    dataset: Dataset,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int,
+    seed: int,
+    pin_memory: bool,
+) -> DataLoader:
+    generator = torch.Generator().manual_seed(seed)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        collate_fn=tinytrace_collate_fn,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+        generator=generator,
     )
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=tinytrace_collate_fn)
 
-    model = TinyTraceModel(config).to(device)
-    optimizer = torch.optim.AdamW(
-        (parameter for parameter in model.parameters() if parameter.requires_grad),
-        lr=args.lr,
-    )
 
-    history = []
-    model.train()
-    for epoch in range(args.epochs):
-        running_loss = 0.0
-        steps = 0
-        for batch in loader:
-            frames = batch["frames"].to(device)
-            frame_times = batch["frame_times"].to(device)
-            frame_mask = batch["frame_mask"].to(device)
-            token_ids = batch["token_ids"].to(device)
-            label_types = batch["label_types"].to(device)
+def move_batch(batch: dict, device: torch.device) -> dict[str, torch.Tensor]:
+    return {
+        key: batch[key].to(device, non_blocking=device.type == "cuda")
+        for key in ("frames", "frame_times", "frame_mask", "token_ids", "label_types")
+    }
 
-            optimizer.zero_grad()
+
+def run_epoch(
+    model: TinyTraceModel,
+    loader: DataLoader,
+    device: torch.device,
+    optimizer: torch.optim.Optimizer | None,
+    gradient_clip: float,
+) -> float:
+    training = optimizer is not None
+    model.train(training)
+    running_loss = 0.0
+    steps = 0
+    context = torch.enable_grad() if training else torch.no_grad()
+    with context:
+        for raw_batch in loader:
+            batch = move_batch(raw_batch, device)
+            if training:
+                optimizer.zero_grad(set_to_none=True)
             output = model(
-                frames,
-                frame_times,
-                token_ids,
-                labels=token_ids,
-                label_types=label_types,
-                frame_mask=frame_mask,
+                batch["frames"],
+                batch["frame_times"],
+                batch["token_ids"],
+                labels=batch["token_ids"],
+                label_types=batch["label_types"],
+                frame_mask=batch["frame_mask"],
             )
             if output.loss is None:
                 continue
-            output.loss.backward()
-            optimizer.step()
-
-            running_loss += output.loss.item()
+            if training:
+                output.loss.backward()
+                if gradient_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        (parameter for parameter in model.parameters() if parameter.requires_grad),
+                        gradient_clip,
+                    )
+                optimizer.step()
+            running_loss += float(output.loss.detach().cpu())
             steps += 1
+    if steps == 0:
+        raise RuntimeError("No loss-producing batches were available.")
+    return running_loss / steps
 
-        avg_loss = running_loss / max(steps, 1)
-        history.append({"epoch": epoch + 1, "loss": avg_loss})
-        print(f"epoch={epoch + 1} loss={avg_loss:.4f}")
+
+def atomic_json(path: Path, payload: object) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temporary.replace(path)
+
+
+def save_checkpoint(
+    path: Path,
+    model: TinyTraceModel,
+    optimizer: torch.optim.Optimizer,
+    config: TinyTraceConfig,
+    epoch: int,
+    best_loss: float,
+    history: list[dict],
+) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "config": config.to_dict(),
+            "epoch": epoch,
+            "best_loss": best_loss,
+            "history": history,
+        },
+        temporary,
+    )
+    temporary.replace(path)
+
+
+@torch.no_grad()
+def dump_predictions(
+    model: TinyTraceModel,
+    dataset: Dataset,
+    config: TinyTraceConfig,
+    device: torch.device,
+    path: Path,
+    sample_count: int,
+) -> None:
+    model.eval()
+    text_tokenizer = CharTokenizer(config.text_vocab_size)
+    time_tokenizer = NumericTokenizer(config.time_vocab, width=6)
+    score_tokenizer = NumericTokenizer(config.score_vocab, width=3)
+    predictions = []
+    for index in range(min(sample_count, len(dataset))):
+        sample = dataset[index]
+        frames = sample["frames"].unsqueeze(0).to(device)
+        frame_times = sample["frame_times"].unsqueeze(0).to(device)
+        prompt_ids = sample["token_ids"][: sample["prompt_length"]].unsqueeze(0).to(device)
+        patch_features = model.visual_encoder.extract_patch_features(frames)
+        generated = model.generate(
+            frames,
+            frame_times,
+            prompt_ids,
+            max_new_tokens=config.max_generated_tokens,
+            visual_patch_features=patch_features,
+        )
+        predicted = decode_event_sequence(
+            generated[0, prompt_ids.size(1) :].tolist(),
+            config,
+            text_tokenizer,
+            time_tokenizer,
+            score_tokenizer,
+        )
+        predictions.append(
+            {
+                "sample_index": index,
+                "ground_truth": sample["events"],
+                "predicted": predicted,
+            }
+        )
+    atomic_json(path, predictions)
+
+
+def main() -> None:
+    args = parse_args()
+    if args.epochs < 1:
+        raise ValueError("epochs must be at least 1.")
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is not available.")
+
+    resume_payload = None
+    if args.resume:
+        resume_payload = torch.load(args.resume, map_location=device, weights_only=False)
+        config = TinyTraceConfig.from_dict(resume_payload["config"])
+    else:
+        config = TinyTraceConfig.from_json(args.config)
+
+    train_dataset = build_dataset(
+        args.dataset_json,
+        config,
+        args.frame_cache_dir,
+        args.allow_random_frames,
+        synthetic_size=args.dataset_size,
+        seed=args.seed,
+    )
+    val_dataset = (
+        build_dataset(
+            args.val_dataset_json,
+            config,
+            args.frame_cache_dir,
+            args.allow_random_frames,
+        )
+        if args.val_dataset_json
+        else None
+    )
+    pin_memory = device.type == "cuda"
+    train_loader = build_loader(
+        train_dataset,
+        args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        seed=args.seed,
+        pin_memory=pin_memory,
+    )
+    val_loader = (
+        build_loader(
+            val_dataset,
+            args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            seed=args.seed,
+            pin_memory=pin_memory,
+        )
+        if val_dataset is not None
+        else None
+    )
+
+    model = TinyTraceModel(config, load_pretrained_visual=resume_payload is None).to(device)
+    optimizer = torch.optim.AdamW(
+        (parameter for parameter in model.parameters() if parameter.requires_grad),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+    start_epoch = 1
+    best_loss = float("inf")
+    history: list[dict] = []
+    if resume_payload is not None:
+        model.load_state_dict(resume_payload["model_state"])
+        optimizer.load_state_dict(resume_payload["optimizer_state"])
+        start_epoch = int(resume_payload["epoch"]) + 1
+        best_loss = float(resume_payload.get("best_loss", float("inf")))
+        history = list(resume_payload.get("history", []))
+        print(f"resumed={args.resume} start_epoch={start_epoch}")
 
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    torch.save({"model_state": model.state_dict(), "config": config.to_dict()}, output_dir / "tinytrace.pt")
-    (output_dir / "history.json").write_text(json.dumps(history, indent=2))
+    checkpoint_dir = output_dir / "checkpoints"
+    prediction_dir = output_dir / "predictions"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    prediction_dir.mkdir(parents=True, exist_ok=True)
+    atomic_json(output_dir / "config.json", config.to_dict())
+
+    if start_epoch > args.epochs:
+        raise ValueError(
+            f"Checkpoint already completed epoch {start_epoch - 1}; target epochs is {args.epochs}."
+        )
+
+    for epoch in range(start_epoch, args.epochs + 1):
+        train_loss = run_epoch(model, train_loader, device, optimizer, args.gradient_clip)
+        val_loss = (
+            run_epoch(model, val_loader, device, optimizer=None, gradient_clip=0.0)
+            if val_loader is not None
+            else None
+        )
+        monitored_loss = val_loss if val_loss is not None else train_loss
+        record = {"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss}
+        history.append(record)
+        atomic_json(output_dir / "history.json", history)
+        print(
+            f"epoch={epoch} train_loss={train_loss:.6f} "
+            + (f"val_loss={val_loss:.6f}" if val_loss is not None else "val_loss=n/a")
+        )
+
+        improved = monitored_loss < best_loss
+        if improved:
+            best_loss = monitored_loss
+        save_checkpoint(
+            checkpoint_dir / "latest.pt",
+            model,
+            optimizer,
+            config,
+            epoch,
+            best_loss,
+            history,
+        )
+        if improved:
+            save_checkpoint(
+                checkpoint_dir / "best.pt",
+                model,
+                optimizer,
+                config,
+                epoch,
+                best_loss,
+                history,
+            )
+        if args.save_every > 0 and epoch % args.save_every == 0:
+            save_checkpoint(
+                checkpoint_dir / f"epoch-{epoch:04d}.pt",
+                model,
+                optimizer,
+                config,
+                epoch,
+                best_loss,
+                history,
+            )
+        if args.prediction_every > 0 and epoch % args.prediction_every == 0:
+            prediction_dataset = val_dataset if val_dataset is not None else train_dataset
+            dump_predictions(
+                model,
+                prediction_dataset,
+                config,
+                device,
+                prediction_dir / f"epoch-{epoch:04d}.json",
+                args.prediction_samples,
+            )
 
 
 if __name__ == "__main__":
