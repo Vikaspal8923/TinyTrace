@@ -294,16 +294,29 @@ class TinyTraceModel(nn.Module):
         id_to_token = {index: token for index, token in enumerate(vocab)}
         values: list[float] = []
         current: list[str] = []
+        width = 6 if vocab == self.config.time_vocab else 3
+
+        def flush_current() -> None:
+            nonlocal current
+            if not current:
+                return
+            token_string = "".join(current)
+            if len(token_string) != width or token_string.count(".") != 1:
+                current = []
+                return
+            try:
+                values.append(float(token_string))
+            except ValueError:
+                pass
+            current = []
+
         for idx in ids:
             token = id_to_token[idx]
             if token == "<sep>":
-                if current:
-                    values.append(float("".join(current)))
-                    current = []
+                flush_current()
             elif token != "<sync>":
                 current.append(token)
-        if current:
-            values.append(float("".join(current)))
+        flush_current()
         return values
 
     def _encode_numeric_values(self, values: list[float], mode: str) -> list[int]:
@@ -327,8 +340,11 @@ class TinyTraceModel(nn.Module):
             # defensive parsing and diagnostics rather than crashing here.
             return time_ids
         if not values:
-            return time_ids
+            fallback = [0.0] * self.config.timestamp_value_count
+            return self._encode_numeric_values(fallback, mode="time")
         clipped = [min(max(value, 0.0), clip_end) for value in values]
+        while len(clipped) < self.config.timestamp_value_count:
+            clipped.append(clipped[-1] if clipped else 0.0)
         if len(clipped) >= 2:
             clipped[1] = max(clipped[0], clipped[1])
         return self._encode_numeric_values(clipped[: self.config.timestamp_value_count], mode="time")
