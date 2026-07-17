@@ -204,15 +204,17 @@ PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python TinyTrace/scripts/train_tinytrac
   --warmup-ratio 0.05 \
   --min-lr-ratio 0.1 \
   --amp auto \
+  --accumulation-steps 2 \
   --early-stopping-patience 3 \
+  --monitor val_loss \
   --output-dir TinyTrace/outputs-qvh
 ```
 
 Real-data training does not silently substitute random frames. Use
-`--allow-random-frames` only for deliberate debugging. Best-checkpoint and
-early-stopping decisions use validation loss whenever `--val-dataset-json` is
-provided. Resume a stopped scheduled run with the same total `--epochs` value
-that was used when the run started:
+`--allow-random-frames` only for deliberate training-data debugging; validation
+always rejects random fallback frames. Training order is derived from the run
+seed and epoch, while validation order is fixed. Resume a stopped scheduled run
+with the same total `--epochs` value that was used when the run started:
 
 ```bash
 PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python TinyTrace/scripts/train_tinytrace.py \
@@ -223,19 +225,39 @@ PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python TinyTrace/scripts/train_tinytrac
   --output-dir TinyTrace/outputs-qvh
 ```
 
-Each run writes `config.json`, `training_config.json`, `optimizer_groups.json`,
-`training_log.jsonl`, `history.json`, `checkpoints/latest.pt`,
-`checkpoints/best.pt`, periodic checkpoints, and epoch prediction JSON files.
+Each run writes `config.json`, `training_config.json`, `run_arguments.json`,
+`run_metadata.json`, `optimizer_groups.json`, `training_log.jsonl`,
+`history.json`, `run_summary.json`, `checkpoints/latest.pt`,
+`checkpoints/best-loss.pt`, `checkpoints/best-primary-metric.pt`, the backwards-
+compatible `checkpoints/best.pt`, bounded periodic checkpoints, and epoch
+prediction JSON files. Prediction records contain raw generated token IDs,
+parsed events, ground truth, parser warnings, generation length, and termination
+reason.
+
 The JSONL log includes per-task raw/weighted losses, target counts, named-group
-learning rates, gradient norms, clipping events, throughput, and validation
-records. `--amp auto` selects BF16 or FP16 on supported CUDA hardware and stays
-in FP32 on CPU. Use `--amp bf16` explicitly to test CPU BF16.
+learning rates, gradient norms, clipping events, micro-step/optimizer-step
+counters, examples/frames/tokens throughput, peak CUDA memory, checkpoint
+selection, and validation records. `--amp auto` selects BF16 or FP16 on
+supported CUDA hardware and stays in FP32 on CPU. Use `--amp bf16` explicitly
+to test CPU BF16.
 
 The optimizer uses named groups for compression, embeddings, LCEM, task heads,
 and MobileCLIP, with separate decay/no-decay groups. Linear warmup is followed
-by cosine decay. Checkpoints restore optimizer, scheduler, AMP scaler, early
-stopping, and global-step state; older one/two-group optimizer checkpoints are
-migrated when possible.
+by cosine decay. Gradient accumulation divides each actual accumulation window
+correctly, including the final partial window, and advances clipping, optimizer,
+scaler, and scheduler state only at update boundaries.
+
+Versioned resumable checkpoints restore optimizer, scheduler, AMP scaler, early
+stopping, RNG, deterministic epoch order, counters, and selection state. Older
+one/two-group optimizer checkpoints are migrated when possible, but legacy
+checkpoints that did not save RNG/data-order state cannot guarantee an exact
+continuation. Periodic retention is configured with `--checkpoint-keep`.
+
+`configs/final_train_qvh500.json` is a validated canonical training profile;
+unknown profile fields fail before training. The stable model baseline keeps
+`dropout=0.0`. `configs/tinytrace_dropout_010.json` is the isolated experimental
+dropout candidate and must not replace the baseline without a controlled
+validation ablation.
 
 For a quick smoke run:
 

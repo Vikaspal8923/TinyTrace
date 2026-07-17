@@ -15,6 +15,7 @@ def decode_event_sequence(
     time_tokenizer: NumericTokenizer,
     score_tokenizer: NumericTokenizer,
     strict: bool = False,
+    warnings: list[str] | None = None,
 ) -> list[dict]:
     events: list[dict] = []
     mode = "time"
@@ -47,6 +48,10 @@ def decode_event_sequence(
             raise EventParseError(
                 "Generated event does not contain a complete timestamp, score, and caption."
             )
+        if not valid and warnings is not None:
+            warnings.append(
+                "Generated event does not contain a complete timestamp, score, and caption."
+            )
         if valid:
             events.append({"timestamp": timestamps, "score": scores, "caption": caption})
         time_ids = []
@@ -58,6 +63,8 @@ def decode_event_sequence(
         nonlocal malformed
         if strict:
             raise EventParseError(message)
+        if warnings is not None:
+            warnings.append(message)
         malformed = True
 
     for token_id in token_ids:

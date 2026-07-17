@@ -320,7 +320,12 @@ class TinyTraceModel(nn.Module):
         return encoded
 
     def _constrain_time_ids(self, time_ids: list[int], clip_end: float) -> list[int]:
-        values = self._decode_numeric_values(time_ids, self.config.time_vocab)
+        try:
+            values = self._decode_numeric_values(time_ids, self.config.time_vocab)
+        except (KeyError, ValueError):
+            # Generation artifacts must preserve malformed numeric output for
+            # defensive parsing and diagnostics rather than crashing here.
+            return time_ids
         if not values:
             return time_ids
         clipped = [min(max(value, 0.0), clip_end) for value in values]
@@ -493,7 +498,8 @@ class TinyTraceModel(nn.Module):
         max_new_tokens: int,
         frame_mask: torch.Tensor | None = None,
         visual_patch_features: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        return_metadata: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, object]]:
         if prompt_ids.size(0) != 1:
             raise ValueError(
                 "TinyTrace generation currently supports batch size 1. "
@@ -513,6 +519,8 @@ class TinyTraceModel(nn.Module):
         phase_start_index = generated.size(1)
         clip_end = float(frame_times.max().item())
         min_time_tokens, min_score_tokens = self._expected_phase_lengths()
+        termination_reason = "max_tokens"
+        forced_caption_termination = False
         for _ in range(max_new_tokens):
             output = self.forward(
                 frames,
@@ -553,6 +561,7 @@ class TinyTraceModel(nn.Module):
 
                 generated = torch.cat([generated, next_token], dim=1)
                 if next_token[0, 0].item() == self.config.eos_token_id:
+                    termination_reason = "eos"
                     break
                 phase_start_index = generated.size(1) - 1
                 continue
@@ -593,6 +602,7 @@ class TinyTraceModel(nn.Module):
                     next_logits[:, self.config.text_vocab_size] = float("-inf")
                 if phase_token_count >= self.config.max_caption_tokens:
                     next_logits[:, : self.config.text_vocab_size] = float("-inf")
+                    forced_caption_termination = True
                 next_token = torch.argmax(next_logits, dim=-1, keepdim=True)
                 next_token = torch.where(
                     next_token == self.config.text_vocab_size,
@@ -633,7 +643,16 @@ class TinyTraceModel(nn.Module):
                 phase_token_count = 0
                 phase_start_index = generated.size(1)
             elif token_value == self.config.eos_token_id:
+                termination_reason = "eos"
                 break
             else:
                 phase_token_count += 1
-        return generated
+        if not return_metadata:
+            return generated
+        return generated, {
+            "termination_reason": termination_reason,
+            "forced_caption_termination": forced_caption_termination,
+            "generated_token_count": generated.size(1) - prompt_ids.size(1),
+            "completed_event_count": event_count,
+            "final_mode": mode,
+        }

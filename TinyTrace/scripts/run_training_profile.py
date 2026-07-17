@@ -10,6 +10,10 @@ import torch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from tinytrace.training import TrainingProfile
 
 
 def parse_args() -> argparse.Namespace:
@@ -61,14 +65,10 @@ def ensure_mobileclip_checkpoint(profile_path: Path, profile: dict) -> None:
 def main() -> None:
     args = parse_args()
     profile_path = Path(args.profile).resolve()
-    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    profile = TrainingProfile.from_json(profile_path).to_dict()
     device = str(profile.get("device", "cuda"))
-    if not device.startswith("cuda"):
-        raise ValueError(
-            f"Training profile device must be a CUDA GPU device, received {device!r}."
-        )
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA GPU is required for training, but no CUDA device is available.")
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("The training profile requests CUDA, but no CUDA device is available.")
 
     ensure_mobileclip_checkpoint(profile_path, profile)
 
@@ -92,14 +92,36 @@ def main() -> None:
         str(profile["epochs"]),
         "--batch-size",
         str(profile["batch_size"]),
+        "--dataset-size",
+        str(profile["dataset_size"]),
         "--lr",
         str(profile["lr"]),
         "--weight-decay",
         str(profile["weight_decay"]),
         "--gradient-clip",
         str(profile["gradient_clip"]),
+        "--warmup-ratio",
+        str(profile["warmup_ratio"]),
+        "--min-lr-ratio",
+        str(profile["min_lr_ratio"]),
+        "--amp",
+        str(profile["amp"]),
+        "--accumulation-steps",
+        str(profile["accumulation_steps"]),
+        "--early-stopping-patience",
+        str(profile["early_stopping_patience"]),
+        "--early-stopping-min-delta",
+        str(profile["early_stopping_min_delta"]),
+        "--early-stopping-min-epochs",
+        str(profile["early_stopping_min_epochs"]),
+        "--monitor",
+        str(profile["monitor"]),
+        "--monitor-mode",
+        str(profile["monitor_mode"]),
         "--save-every",
         str(profile["save_every"]),
+        "--checkpoint-keep",
+        str(profile["checkpoint_keep"]),
         "--prediction-every",
         str(profile["prediction_every"]),
         "--prediction-samples",
@@ -110,6 +132,8 @@ def main() -> None:
         str(profile["num_workers"]),
         "--log-every",
         str(profile.get("log_every", 25)),
+        "--max-steps-per-epoch",
+        str(profile["max_steps_per_epoch"]),
         "--stage2-start-epoch",
         str(profile.get("stage2_start_epoch", 0)),
         "--stage2-visual-lr-scale",
@@ -118,7 +142,12 @@ def main() -> None:
         str(profile.get("stage2_unfreeze_strategy", "conv_exp")),
         "--seed",
         str(profile["seed"]),
+        "--deterministic" if profile["deterministic"] else "--no-deterministic",
     ]
+    if profile["allow_random_frames"]:
+        command.append("--allow-random-frames")
+    if profile["resume"]:
+        command.extend(["--resume", str(resolve_profile_path(profile_path, profile["resume"]))])
 
     print("Running TinyTrace training profile:")
     print(json.dumps(profile, indent=2))

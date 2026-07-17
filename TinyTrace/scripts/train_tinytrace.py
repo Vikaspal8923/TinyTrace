@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import random
 import sys
 import time
+import uuid
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -26,18 +29,25 @@ from tinytrace import (
 )
 from tinytrace.tokenizers import CharTokenizer, NumericTokenizer
 from tinytrace.training import (
+    CHECKPOINT_FORMAT_VERSION,
     OPTIMIZER_FORMAT_VERSION,
     AmpSettings,
     EarlyStopping,
     JsonlLogger,
+    SUPPORTED_MONITORS,
     TrainingConfig,
     build_named_optimizer,
     build_warmup_cosine_scheduler,
+    capture_rng_state,
+    collect_run_metadata,
     current_learning_rates,
     load_optimizer_state_compat,
     optimizer_group_summary,
+    prune_periodic_checkpoints,
     resolve_amp_settings,
+    restore_rng_state,
     set_scheduler_step,
+    validate_checkpoint_version,
 )
 
 
@@ -51,9 +61,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-ratio", type=float, default=0.05)
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     parser.add_argument("--amp", choices=("off", "auto", "fp16", "bf16"), default="off")
+    parser.add_argument("--accumulation-steps", type=int, default=1)
     parser.add_argument("--early-stopping-patience", type=int, default=0)
     parser.add_argument("--early-stopping-min-delta", type=float, default=0.0)
     parser.add_argument("--early-stopping-min-epochs", type=int, default=1)
+    parser.add_argument("--monitor", type=str, default="val_loss")
+    parser.add_argument("--monitor-mode", choices=("min", "max"), default="min")
     parser.add_argument("--dataset-size", type=int, default=128)
     parser.add_argument("--dataset-json", type=str, default="")
     parser.add_argument("--val-dataset-json", type=str, default="")
@@ -63,6 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-random-frames", action="store_true")
     parser.add_argument("--resume", type=str, default="")
     parser.add_argument("--save-every", type=int, default=5)
+    parser.add_argument("--checkpoint-keep", type=int, default=3)
     parser.add_argument("--prediction-every", type=int, default=1)
     parser.add_argument("--prediction-samples", type=int, default=2)
     parser.add_argument("--metrics-every", type=int, default=1)
@@ -73,6 +87,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage2-visual-lr-scale", type=float, default=0.1)
     parser.add_argument("--stage2-unfreeze-strategy", type=str, default="conv_exp")
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument(
+        "--deterministic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--device", type=str, default="cpu")
     return parser.parse_args()
 
@@ -140,7 +159,11 @@ def run_epoch(
     amp_settings: AmpSettings | None = None,
     event_logger: JsonlLogger | None = None,
     global_step: int = 0,
+    global_micro_step: int = 0,
+    accumulation_steps: int = 1,
 ) -> tuple[dict, int]:
+    if accumulation_steps < 1:
+        raise ValueError("accumulation_steps must be positive.")
     training = optimizer is not None
     model.train(training)
     running_loss = 0.0
@@ -152,19 +175,26 @@ def run_epoch(
     clipped_steps = 0
     optimizer_steps = 0
     examples = 0
+    frames_processed = 0
+    tokens_processed = 0
     steps = 0
-    total_steps = len(loader)
+    total_steps = min(len(loader), max_steps_per_epoch) if max_steps_per_epoch > 0 else len(loader)
     epoch_started = time.perf_counter()
     amp_settings = amp_settings or AmpSettings(False, None, False)
     context = torch.enable_grad() if training else torch.no_grad()
+    current_window_size = 1
     with context:
         for step_index, raw_batch in enumerate(loader, start=1):
             if max_steps_per_epoch > 0 and step_index > max_steps_per_epoch:
                 break
             batch = move_batch(raw_batch, device)
             examples += int(batch["frames"].size(0))
-            if training:
+            frames_processed += int(batch["frame_mask"].sum().item())
+            tokens_processed += int(batch["token_ids"].ne(model.config.pad_token_id).sum().item())
+            window_position = (step_index - 1) % accumulation_steps
+            if training and window_position == 0:
                 optimizer.zero_grad(set_to_none=True)
+                current_window_size = min(accumulation_steps, total_steps - step_index + 1)
             autocast_context = (
                 torch.autocast(device_type=device.type, dtype=amp_settings.dtype)
                 if amp_settings.enabled
@@ -181,37 +211,66 @@ def run_epoch(
                 )
             if output.loss is None:
                 continue
+            optimizer_step_performed = False
+            gradient_norm_value: float | None = None
             if training:
+                normalized_loss = output.loss / current_window_size
                 if scaler is not None and scaler.is_enabled():
-                    scale_before = scaler.get_scale()
-                    scaler.scale(output.loss).backward()
-                    scaler.unscale_(optimizer)
+                    scaler.scale(normalized_loss).backward()
                 else:
-                    scale_before = None
-                    output.loss.backward()
-                gradient_norm = torch.nn.utils.clip_grad_norm_(
-                    (parameter for parameter in model.parameters() if parameter.requires_grad),
-                    gradient_clip if gradient_clip > 0 else float("inf"),
-                    error_if_nonfinite=True,
-                )
-                gradient_norm_value = float(gradient_norm.detach().cpu())
-                gradient_norm_total += gradient_norm_value
-                gradient_norm_steps += 1
-                if gradient_clip > 0 and gradient_norm_value > gradient_clip:
-                    clipped_steps += 1
+                    normalized_loss.backward()
 
-                optimizer_step_performed = True
-                if scaler is not None and scaler.is_enabled():
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer_step_performed = scaler.get_scale() >= scale_before
-                else:
-                    optimizer.step()
-                if optimizer_step_performed:
-                    if scheduler is not None:
-                        scheduler.step()
-                    global_step += 1
-                    optimizer_steps += 1
+                at_boundary = window_position + 1 == current_window_size
+                if at_boundary:
+                    if scaler is not None and scaler.is_enabled():
+                        scale_before = scaler.get_scale()
+                        scaler.unscale_(optimizer)
+                    else:
+                        scale_before = None
+                    gradient_norm = torch.nn.utils.clip_grad_norm_(
+                        (parameter for parameter in model.parameters() if parameter.requires_grad),
+                        gradient_clip if gradient_clip > 0 else float("inf"),
+                        error_if_nonfinite=False,
+                    )
+                    gradient_norm_value = float(gradient_norm.detach().float().cpu())
+                    finite_gradient = math.isfinite(gradient_norm_value)
+                    if finite_gradient:
+                        gradient_norm_total += gradient_norm_value
+                        gradient_norm_steps += 1
+                        if gradient_clip > 0 and gradient_norm_value > gradient_clip:
+                            clipped_steps += 1
+                    elif event_logger is not None:
+                        event_logger.log(
+                            {
+                                "record_type": "nonfinite_gradient",
+                                "split": split,
+                                "epoch": epoch,
+                                "micro_step": step_index,
+                                "global_micro_step": global_micro_step + step_index,
+                                "global_step": global_step,
+                                "gradient_norm": gradient_norm_value,
+                                "amp_scaled": bool(scaler is not None and scaler.is_enabled()),
+                            }
+                        )
+
+                    if scaler is not None and scaler.is_enabled():
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer_step_performed = finite_gradient and scaler.get_scale() >= scale_before
+                    elif finite_gradient:
+                        optimizer.step()
+                        optimizer_step_performed = True
+                    else:
+                        optimizer.zero_grad(set_to_none=True)
+                        raise FloatingPointError(
+                            f"Non-finite gradient norm at epoch={epoch}, micro_step={step_index}."
+                        )
+                    optimizer.zero_grad(set_to_none=True)
+                    if optimizer_step_performed:
+                        if scheduler is not None:
+                            scheduler.step()
+                        global_step += 1
+                        optimizer_steps += 1
 
             loss_value = float(output.loss.detach().float().cpu())
             running_loss += loss_value
@@ -229,7 +288,8 @@ def run_epoch(
                 "record_type": "step",
                 "split": split,
                 "epoch": epoch,
-                "step": step_index,
+                "micro_step": step_index,
+                "global_micro_step": global_micro_step + step_index,
                 "global_step": global_step,
                 "loss": loss_value,
                 "loss_components": {
@@ -245,11 +305,14 @@ def run_epoch(
                 },
                 "learning_rates": current_learning_rates(optimizer) if optimizer is not None else {},
             }
-            if training and gradient_norm_steps:
+            if training and gradient_norm_value is not None:
                 step_record["gradient_norm"] = gradient_norm_value
                 step_record["gradient_clipped"] = bool(
-                    gradient_clip > 0 and gradient_norm_value > gradient_clip
+                    math.isfinite(gradient_norm_value)
+                    and gradient_clip > 0
+                    and gradient_norm_value > gradient_clip
                 )
+                step_record["optimizer_step_performed"] = optimizer_step_performed
             if event_logger is not None:
                 event_logger.log(step_record)
             if log_every > 0 and (step_index % log_every == 0 or step_index == total_steps):
@@ -274,13 +337,23 @@ def run_epoch(
         "steps": steps,
         "optimizer_steps": optimizer_steps,
         "examples": examples,
+        "frames": frames_processed,
+        "tokens": tokens_processed,
         "elapsed_seconds": elapsed,
         "examples_per_second": examples / elapsed if elapsed > 0 else 0.0,
+        "frames_per_second": frames_processed / elapsed if elapsed > 0 else 0.0,
+        "tokens_per_second": tokens_processed / elapsed if elapsed > 0 else 0.0,
         "mean_gradient_norm": (
             gradient_norm_total / gradient_norm_steps if gradient_norm_steps else None
         ),
         "clipped_steps": clipped_steps,
         "learning_rates": current_learning_rates(optimizer) if optimizer is not None else {},
+        "peak_accelerator_memory_allocated": (
+            int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else None
+        ),
+        "peak_accelerator_memory_reserved": (
+            int(torch.cuda.max_memory_reserved(device)) if device.type == "cuda" else None
+        ),
     }
     if event_logger is not None:
         event_logger.log(
@@ -301,6 +374,13 @@ def atomic_json(path: Path, payload: object) -> None:
     temporary.replace(path)
 
 
+def atomic_torch_save(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
+
+
 def save_checkpoint(
     path: Path,
     model: TinyTraceModel,
@@ -315,10 +395,17 @@ def save_checkpoint(
     training_config: TrainingConfig | None = None,
     early_stopping: EarlyStopping | None = None,
     global_step: int = 0,
+    global_micro_step: int = 0,
+    global_examples: int = 0,
+    selection_state: dict | None = None,
+    run_metadata: dict | None = None,
+    accumulation_state: dict | None = None,
 ) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    torch.save(
+    atomic_torch_save(
+        path,
         {
+            "checkpoint_format_version": CHECKPOINT_FORMAT_VERSION,
+            "artifact_type": "resumable_training_checkpoint",
             "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "config": config.to_dict(),
@@ -332,10 +419,14 @@ def save_checkpoint(
             "training_config": training_config.to_dict() if training_config is not None else None,
             "early_stopping_state": early_stopping.state_dict() if early_stopping is not None else None,
             "global_step": global_step,
+            "global_micro_step": global_micro_step,
+            "global_examples": global_examples,
+            "accumulation_state": dict(accumulation_state or {"pending_micro_steps": 0}),
+            "selection_state": dict(selection_state or {}),
+            "rng_state": capture_rng_state(),
+            "run_metadata": dict(run_metadata or {}),
         },
-        temporary,
     )
-    temporary.replace(path)
 
 
 @torch.no_grad()
@@ -345,45 +436,58 @@ def collect_predictions(
     config: TinyTraceConfig,
     device: torch.device,
     sample_limit: int | None = None,
+    checkpoint_identity: str | None = None,
 ) -> list[dict]:
+    was_training = model.training
     model.eval()
     text_tokenizer = CharTokenizer(config.text_vocab_size)
     time_tokenizer = NumericTokenizer(config.time_vocab, width=6)
     score_tokenizer = NumericTokenizer(config.score_vocab, width=3)
     predictions = []
     total = len(dataset) if sample_limit is None else min(sample_limit, len(dataset))
-    for index in range(total):
-        sample = dataset[index]
-        frames = sample["frames"].unsqueeze(0).to(device)
-        frame_times = sample["frame_times"].unsqueeze(0).to(device)
-        frame_mask = sample.get("frame_mask")
-        frame_mask = frame_mask.unsqueeze(0).to(device) if frame_mask is not None else None
-        prompt_ids = sample["token_ids"][: sample["prompt_length"]].unsqueeze(0).to(device)
-        patch_features = model.visual_encoder.extract_patch_features(frames)
-        generated = model.generate(
-            frames,
-            frame_times,
-            prompt_ids,
-            max_new_tokens=config.max_generated_tokens,
-            frame_mask=frame_mask,
-            visual_patch_features=patch_features,
-        )
-        predicted = decode_event_sequence(
-            generated[0, prompt_ids.size(1) :].tolist(),
-            config,
-            text_tokenizer,
-            time_tokenizer,
-            score_tokenizer,
-        )
-        predictions.append(
-            {
-                "sample_index": index,
-                "source_id": sample.get("source_id"),
-                "video_path": sample.get("video_path"),
-                "ground_truth": sample["events"],
-                "predicted": predicted,
-            }
-        )
+    try:
+        for index in range(total):
+            sample = dataset[index]
+            frames = sample["frames"].unsqueeze(0).to(device)
+            frame_times = sample["frame_times"].unsqueeze(0).to(device)
+            frame_mask = sample.get("frame_mask")
+            frame_mask = frame_mask.unsqueeze(0).to(device) if frame_mask is not None else None
+            prompt_ids = sample["token_ids"][: sample["prompt_length"]].unsqueeze(0).to(device)
+            patch_features = model.visual_encoder.extract_patch_features(frames)
+            generated, generation_metadata = model.generate(
+                frames,
+                frame_times,
+                prompt_ids,
+                max_new_tokens=config.max_generated_tokens,
+                frame_mask=frame_mask,
+                visual_patch_features=patch_features,
+                return_metadata=True,
+            )
+            raw_ids = generated[0, prompt_ids.size(1) :].tolist()
+            parser_warnings: list[str] = []
+            predicted = decode_event_sequence(
+                raw_ids,
+                config,
+                text_tokenizer,
+                time_tokenizer,
+                score_tokenizer,
+                warnings=parser_warnings,
+            )
+            predictions.append(
+                {
+                    "sample_index": index,
+                    "source_id": sample.get("source_id"),
+                    "video_path": sample.get("video_path"),
+                    "checkpoint_identity": checkpoint_identity,
+                    "ground_truth": sample["events"],
+                    "raw_generated_token_ids": raw_ids,
+                    "predicted": predicted,
+                    "generation": generation_metadata,
+                    "parser_warnings": parser_warnings,
+                }
+            )
+    finally:
+        model.train(was_training)
     return predictions
 
 
@@ -395,20 +499,54 @@ def dump_predictions(
     device: torch.device,
     path: Path,
     sample_count: int,
+    checkpoint_identity: str | None = None,
 ) -> None:
-    predictions = collect_predictions(model, dataset, config, device, sample_limit=sample_count)
+    predictions = collect_predictions(
+        model,
+        dataset,
+        config,
+        device,
+        sample_limit=sample_count,
+        checkpoint_identity=checkpoint_identity,
+    )
     atomic_json(path, predictions)
 
 
-def main() -> None:
+def summarize_prediction_artifacts(predictions: list[dict]) -> dict[str, float | int]:
+    total = len(predictions)
+    if total == 0:
+        return {
+            "samples": 0,
+            "eos_termination_rate": 0.0,
+            "maximum_budget_termination_rate": 0.0,
+            "forced_caption_termination_rate": 0.0,
+            "parser_warning_rate": 0.0,
+        }
+    return {
+        "samples": total,
+        "eos_termination_rate": sum(
+            item["generation"]["termination_reason"] == "eos" for item in predictions
+        )
+        / total,
+        "maximum_budget_termination_rate": sum(
+            item["generation"]["termination_reason"] == "max_tokens" for item in predictions
+        )
+        / total,
+        "forced_caption_termination_rate": sum(
+            bool(item["generation"]["forced_caption_termination"]) for item in predictions
+        )
+        / total,
+        "parser_warning_rate": sum(bool(item["parser_warnings"]) for item in predictions) / total,
+    }
+
+
+def _run_training() -> None:
     args = parse_args()
     if args.epochs < 1:
         raise ValueError("epochs must be at least 1.")
     if not args.dataset_json and not args.allow_random_frames:
         # Synthetic mode is always allowed when no dataset json is provided.
         args.allow_random_frames = True
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available.")
@@ -416,9 +554,36 @@ def main() -> None:
     resume_payload = None
     if args.resume:
         resume_payload = torch.load(args.resume, map_location=device, weights_only=False)
+        validate_checkpoint_version(resume_payload)
+        saved_metadata = resume_payload.get("run_metadata", {})
+        args.seed = int(saved_metadata.get("seed", args.seed))
+        saved_arguments = saved_metadata.get("run_arguments", {})
+        for field in (
+            "dataset_json",
+            "val_dataset_json",
+            "dataset_size",
+            "batch_size",
+            "max_steps_per_epoch",
+            "num_workers",
+            "allow_random_frames",
+        ):
+            if field in saved_arguments:
+                setattr(args, field, saved_arguments[field])
+        saved_deterministic = resume_payload.get("training_state", {}).get("deterministic")
+        if saved_deterministic is not None:
+            args.deterministic = bool(saved_deterministic)
         config = TinyTraceConfig.from_dict(resume_payload["config"])
     else:
         config = TinyTraceConfig.from_json(args.config)
+
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    torch.use_deterministic_algorithms(args.deterministic)
+    if torch.backends.cudnn.is_available():
+        torch.backends.cudnn.deterministic = args.deterministic
+        torch.backends.cudnn.benchmark = not args.deterministic
 
     if args.dataset_json and not Path(args.dataset_json).is_file():
         raise FileNotFoundError(f"Training dataset JSON not found: {args.dataset_json}")
@@ -438,7 +603,7 @@ def main() -> None:
             args.val_dataset_json,
             config,
             args.frame_cache_dir,
-            args.allow_random_frames,
+            False,
         )
         if args.val_dataset_json
         else None
@@ -476,6 +641,10 @@ def main() -> None:
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_min_delta=args.early_stopping_min_delta,
         early_stopping_min_epochs=args.early_stopping_min_epochs,
+        accumulation_steps=args.accumulation_steps,
+        monitor=args.monitor,
+        monitor_mode=args.monitor_mode,
+        checkpoint_keep=args.checkpoint_keep,
     )
     saved_training_config = resume_payload.get("training_config") if resume_payload else None
     training_config = (
@@ -483,11 +652,17 @@ def main() -> None:
     )
     if training_config.early_stopping_patience > 0 and val_loader is None:
         raise ValueError("Validation data is required when early stopping is enabled.")
+    metric_monitors = SUPPORTED_MONITORS - {"val_loss", "train_loss"}
+    if training_config.monitor in metric_monitors and val_dataset is None:
+        raise ValueError("A validation dataset is required for structured metric monitoring.")
 
-    steps_per_epoch = len(train_loader)
+    micro_steps_per_epoch = len(train_loader)
     if args.max_steps_per_epoch > 0:
-        steps_per_epoch = min(steps_per_epoch, args.max_steps_per_epoch)
-    total_optimizer_steps = args.epochs * steps_per_epoch
+        micro_steps_per_epoch = min(micro_steps_per_epoch, args.max_steps_per_epoch)
+    optimizer_steps_per_epoch = math.ceil(
+        micro_steps_per_epoch / training_config.accumulation_steps
+    )
+    total_optimizer_steps = args.epochs * optimizer_steps_per_epoch
     if total_optimizer_steps < 1:
         raise ValueError("Training must contain at least one optimizer step.")
     warmup_steps = min(
@@ -500,6 +675,10 @@ def main() -> None:
     best_loss = float("inf")
     history: list[dict] = []
     global_step = 0
+    global_micro_step = 0
+    global_examples = 0
+    best_loss_epoch = 0
+    best_loss_step = 0
     stage2_activated = False
     active_stage2_strategy = args.stage2_unfreeze_strategy
     active_stage2_start_epoch = args.stage2_start_epoch
@@ -539,6 +718,8 @@ def main() -> None:
         patience=training_config.early_stopping_patience,
         min_delta=training_config.early_stopping_min_delta,
         min_epochs=training_config.early_stopping_min_epochs,
+        mode=training_config.monitor_mode,
+        monitor=training_config.monitor,
     )
     if resume_payload is not None:
         load_optimizer_state_compat(
@@ -551,7 +732,19 @@ def main() -> None:
         start_epoch = int(resume_payload["epoch"]) + 1
         best_loss = float(resume_payload.get("best_loss", float("inf")))
         history = list(resume_payload.get("history", []))
-        global_step = int(resume_payload.get("global_step", (start_epoch - 1) * steps_per_epoch))
+        global_step = int(
+            resume_payload.get("global_step", (start_epoch - 1) * optimizer_steps_per_epoch)
+        )
+        global_micro_step = int(
+            resume_payload.get("global_micro_step", (start_epoch - 1) * micro_steps_per_epoch)
+        )
+        global_examples = int(resume_payload.get("global_examples", 0))
+        accumulation_state = resume_payload.get("accumulation_state", {})
+        if int(accumulation_state.get("pending_micro_steps", 0)) != 0:
+            raise ValueError("TinyTrace can resume only from a completed accumulation boundary.")
+        saved_selection = resume_payload.get("selection_state", {})
+        best_loss_epoch = int(saved_selection.get("best_loss_epoch", 0))
+        best_loss_step = int(saved_selection.get("best_loss_step", 0))
         saved_total_steps = resume_payload.get("training_state", {}).get("total_optimizer_steps")
         if saved_total_steps is not None and int(saved_total_steps) != total_optimizer_steps:
             raise ValueError(
@@ -568,6 +761,7 @@ def main() -> None:
             early_stopping.load_state_dict(resume_payload["early_stopping_state"])
         else:
             early_stopping.best = best_loss
+        restore_rng_state(resume_payload.get("rng_state"))
         print(f"resumed={args.resume} start_epoch={start_epoch}")
 
     output_dir = Path(args.output_dir)
@@ -578,8 +772,47 @@ def main() -> None:
     Path(args.frame_cache_dir).mkdir(parents=True, exist_ok=True)
     atomic_json(output_dir / "config.json", config.to_dict())
     atomic_json(output_dir / "training_config.json", training_config.to_dict())
+    run_arguments = vars(args).copy()
+    run_arguments.update(
+        {
+            "lr": training_config.learning_rate,
+            "weight_decay": training_config.weight_decay,
+            "gradient_clip": training_config.gradient_clip,
+            "warmup_ratio": training_config.warmup_ratio,
+            "min_lr_ratio": training_config.min_lr_ratio,
+            "amp": training_config.amp_mode,
+            "accumulation_steps": training_config.accumulation_steps,
+            "early_stopping_patience": training_config.early_stopping_patience,
+            "early_stopping_min_delta": training_config.early_stopping_min_delta,
+            "early_stopping_min_epochs": training_config.early_stopping_min_epochs,
+            "monitor": training_config.monitor,
+            "monitor_mode": training_config.monitor_mode,
+            "checkpoint_keep": training_config.checkpoint_keep,
+        }
+    )
+    atomic_json(output_dir / "run_arguments.json", run_arguments)
     atomic_json(output_dir / "optimizer_groups.json", optimizer_group_summary(optimizer))
     event_logger = JsonlLogger(output_dir / "training_log.jsonl")
+    run_metadata = collect_run_metadata(device, args.seed, args.deterministic)
+    run_metadata.update(
+        {
+            "run_id": (
+                resume_payload.get("run_metadata", {}).get("run_id")
+                if resume_payload is not None
+                else uuid.uuid4().hex
+            ) or uuid.uuid4().hex,
+            "dataset_json": args.dataset_json or None,
+            "validation_dataset_json": args.val_dataset_json or None,
+            "model_config_sha256": hashlib.sha256(
+                json.dumps(config.to_dict(), sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+            "training_config_sha256": hashlib.sha256(
+                json.dumps(training_config.to_dict(), sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+            "run_arguments": run_arguments,
+        }
+    )
+    atomic_json(output_dir / "run_metadata.json", run_metadata)
     event_logger.log(
         {
             "record_type": "run_start",
@@ -587,9 +820,11 @@ def main() -> None:
             "total_epochs": args.epochs,
             "total_optimizer_steps": total_optimizer_steps,
             "warmup_steps": warmup_steps,
+            "accumulation_steps": training_config.accumulation_steps,
             "amp_enabled": amp_settings.enabled,
             "amp_dtype": str(amp_settings.dtype),
             "optimizer_groups": optimizer_group_summary(optimizer),
+            "run_metadata": run_metadata,
         }
     )
 
@@ -598,7 +833,22 @@ def main() -> None:
             f"Checkpoint already completed epoch {start_epoch - 1}; target epochs is {args.epochs}."
         )
 
+    completed_epoch = start_epoch - 1
+    stop_reason = "completed"
+    last_structured_metrics = None
+    last_generation_diagnostics = None
     for epoch in range(start_epoch, args.epochs + 1):
+        completed_epoch = epoch
+        train_loader = build_loader(
+            train_dataset,
+            args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            seed=args.seed + epoch - 1,
+            pin_memory=pin_memory,
+        )
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         if (
             active_stage2_start_epoch > 0
             and epoch >= active_stage2_start_epoch
@@ -637,7 +887,11 @@ def main() -> None:
             amp_settings=amp_settings,
             event_logger=event_logger,
             global_step=global_step,
+            global_micro_step=global_micro_step,
+            accumulation_steps=training_config.accumulation_steps,
         )
+        global_micro_step += int(train_metrics["steps"])
+        global_examples += int(train_metrics["examples"])
         validation_result = (
             run_epoch(
                 model,
@@ -652,19 +906,77 @@ def main() -> None:
                 amp_settings=amp_settings,
                 event_logger=event_logger,
                 global_step=global_step,
+                global_micro_step=global_micro_step,
             )
             if val_loader is not None
             else None
         )
         val_metrics = validation_result[0] if validation_result is not None else None
-        monitored_loss = val_metrics["loss"] if val_metrics is not None else train_metrics["loss"]
         selection_split = "validation" if val_metrics is not None else "training_fallback"
+        checkpoint_identity = f"{run_metadata['run_id']}:epoch-{epoch:04d}"
+        needs_structured_metrics = (
+            val_dataset is not None
+            and (
+                training_config.monitor in metric_monitors
+                or (args.metrics_every > 0 and epoch % args.metrics_every == 0)
+            )
+        )
+        metrics_predictions = (
+            collect_predictions(
+                model,
+                val_dataset,
+                config,
+                device,
+                sample_limit=None,
+                checkpoint_identity=checkpoint_identity,
+            )
+            if needs_structured_metrics and val_dataset is not None
+            else None
+        )
+        structured_metrics = (
+            evaluate_event_predictions(metrics_predictions)
+            if metrics_predictions is not None
+            else None
+        )
+        generation_diagnostics = (
+            summarize_prediction_artifacts(metrics_predictions)
+            if metrics_predictions is not None
+            else None
+        )
+        if structured_metrics is not None:
+            last_structured_metrics = structured_metrics
+        if generation_diagnostics is not None:
+            last_generation_diagnostics = generation_diagnostics
+        if structured_metrics is not None:
+            atomic_json(output_dir / "metrics.json", structured_metrics)
+            atomic_json(output_dir / f"metrics-epoch-{epoch:04d}.json", structured_metrics)
+            print(
+                "metrics "
+                + " ".join(f"{key}={value:.4f}" for key, value in structured_metrics.items())
+            )
+
+        if training_config.monitor == "train_loss":
+            monitored_value = float(train_metrics["loss"])
+        elif training_config.monitor == "val_loss":
+            monitored_value = float(
+                val_metrics["loss"] if val_metrics is not None else train_metrics["loss"]
+            )
+        else:
+            assert structured_metrics is not None
+            monitored_value = float(structured_metrics[training_config.monitor])
+
+        validation_loss = float(val_metrics["loss"]) if val_metrics is not None else float(train_metrics["loss"])
+        loss_improved = validation_loss < best_loss
+        if loss_improved:
+            best_loss = validation_loss
+            best_loss_epoch = epoch
+            best_loss_step = global_step
         improved, should_stop = early_stopping.update(
-            monitored_loss,
+            monitored_value,
             epoch,
+            global_step=global_step,
             active=global_step >= warmup_steps,
         )
-        best_loss = early_stopping.best
         record = {
             "epoch": epoch,
             "train_loss": train_metrics["loss"],
@@ -673,7 +985,14 @@ def main() -> None:
             "validation": val_metrics,
             "selection_split": selection_split,
             "improved": improved,
+            "loss_improved": loss_improved,
+            "monitor": training_config.monitor,
+            "monitored_value": monitored_value,
+            "structured_metrics": structured_metrics,
+            "generation_diagnostics": generation_diagnostics,
             "global_step": global_step,
+            "global_micro_step": global_micro_step,
+            "global_examples": global_examples,
         }
         history.append(record)
         atomic_json(output_dir / "history.json", history)
@@ -694,88 +1013,110 @@ def main() -> None:
             "total_optimizer_steps": total_optimizer_steps,
             "warmup_steps": warmup_steps,
             "selection_split": selection_split,
+            "deterministic": args.deterministic,
         }
-        save_checkpoint(
-            checkpoint_dir / "latest.pt",
-            model,
-            optimizer,
-            config,
-            epoch,
-            best_loss,
-            history,
+        if args.prediction_every > 0 and epoch % args.prediction_every == 0:
+            if metrics_predictions is not None:
+                atomic_json(
+                    prediction_dir / f"epoch-{epoch:04d}.json",
+                    metrics_predictions[: args.prediction_samples],
+                )
+            else:
+                prediction_dataset = val_dataset if val_dataset is not None else train_dataset
+                prediction_subset = collect_predictions(
+                    model,
+                    prediction_dataset,
+                    config,
+                    device,
+                    sample_limit=args.prediction_samples,
+                    checkpoint_identity=checkpoint_identity,
+                )
+                atomic_json(prediction_dir / f"epoch-{epoch:04d}.json", prediction_subset)
+                generation_diagnostics = summarize_prediction_artifacts(prediction_subset)
+                last_generation_diagnostics = generation_diagnostics
+            event_logger.log(
+                {
+                    "record_type": "validation_generation",
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    **(generation_diagnostics or {}),
+                }
+            )
+
+        selection_state = {
+            "monitor": training_config.monitor,
+            "monitor_mode": training_config.monitor_mode,
+            "best_primary_value": early_stopping.best,
+            "best_primary_epoch": early_stopping.best_epoch,
+            "best_primary_step": early_stopping.best_step,
+            "best_loss": best_loss,
+            "best_loss_epoch": best_loss_epoch,
+            "best_loss_step": best_loss_step,
+        }
+        event_logger.log(
+            {
+                "record_type": "checkpoint_selection",
+                "epoch": epoch,
+                "global_step": global_step,
+                "monitored_value": monitored_value,
+                "primary_improved": improved,
+                "loss_improved": loss_improved,
+                **selection_state,
+            }
+        )
+        checkpoint_arguments = dict(
+            model=model,
+            optimizer=optimizer,
+            config=config,
+            epoch=epoch,
+            best_loss=best_loss,
+            history=history,
             training_state=checkpoint_training_state,
             scheduler=scheduler,
             scaler=scaler,
             training_config=training_config,
             early_stopping=early_stopping,
             global_step=global_step,
+            global_micro_step=global_micro_step,
+            global_examples=global_examples,
+            selection_state=selection_state,
+            run_metadata=run_metadata,
+            accumulation_state={"pending_micro_steps": 0},
         )
+        save_checkpoint(checkpoint_dir / "latest.pt", **checkpoint_arguments)
+        if loss_improved:
+            save_checkpoint(checkpoint_dir / "best-loss.pt", **checkpoint_arguments)
         if improved:
-            save_checkpoint(
-                checkpoint_dir / "best.pt",
-                model,
-                optimizer,
-                config,
-                epoch,
-                best_loss,
-                history,
-                training_state=checkpoint_training_state,
-                scheduler=scheduler,
-                scaler=scaler,
-                training_config=training_config,
-                early_stopping=early_stopping,
-                global_step=global_step,
-            )
-            torch.save(
+            save_checkpoint(checkpoint_dir / "best-primary-metric.pt", **checkpoint_arguments)
+            save_checkpoint(checkpoint_dir / "best.pt", **checkpoint_arguments)
+            atomic_torch_save(
+                output_dir / "tinytrace.pt",
                 {
+                    "checkpoint_format_version": CHECKPOINT_FORMAT_VERSION,
+                    "artifact_type": "inference_checkpoint",
                     "model_state": model.state_dict(),
                     "config": config.to_dict(),
                     "epoch": epoch,
-                    "best_loss": best_loss,
-                    "history": history,
+                    "selection_state": selection_state,
+                    "run_metadata": run_metadata,
                 },
-                output_dir / "tinytrace.pt",
             )
         if args.save_every > 0 and epoch % args.save_every == 0:
-            save_checkpoint(
-                checkpoint_dir / f"epoch-{epoch:04d}.pt",
-                model,
-                optimizer,
-                config,
-                epoch,
-                best_loss,
-                history,
-                training_state=checkpoint_training_state,
-                scheduler=scheduler,
-                scaler=scaler,
-                training_config=training_config,
-                early_stopping=early_stopping,
-                global_step=global_step,
-            )
-        if args.prediction_every > 0 and epoch % args.prediction_every == 0:
-            prediction_dataset = val_dataset if val_dataset is not None else train_dataset
-            dump_predictions(
-                model,
-                prediction_dataset,
-                config,
-                device,
-                prediction_dir / f"epoch-{epoch:04d}.json",
-                args.prediction_samples,
-            )
-        if args.metrics_every > 0 and val_dataset is not None and epoch % args.metrics_every == 0:
-            metrics_predictions = collect_predictions(model, val_dataset, config, device, sample_limit=None)
-            metrics = evaluate_event_predictions(metrics_predictions)
-            atomic_json(output_dir / "metrics.json", metrics)
-            atomic_json(output_dir / f"metrics-epoch-{epoch:04d}.json", metrics)
-            print("metrics " + " ".join(f"{key}={value:.4f}" for key, value in metrics.items()))
+            save_checkpoint(checkpoint_dir / f"epoch-{epoch:04d}.pt", **checkpoint_arguments)
+            prune_periodic_checkpoints(checkpoint_dir, training_config.checkpoint_keep)
         if should_stop:
+            stop_reason = early_stopping.stop_reason or "early_stopping"
             event_logger.log(
                 {
                     "record_type": "early_stop",
                     "epoch": epoch,
                     "global_step": global_step,
                     "best_loss": best_loss,
+                    "monitor": training_config.monitor,
+                    "best_primary_value": early_stopping.best,
+                    "best_primary_step": early_stopping.best_step,
                     "bad_epochs": early_stopping.bad_epochs,
+                    "reason": stop_reason,
                 }
             )
             print(
@@ -783,6 +1124,49 @@ def main() -> None:
                 f"bad_epochs={early_stopping.bad_epochs}"
             )
             break
+
+    run_summary = {
+        "run_id": run_metadata["run_id"],
+        "status": "early_stopped" if stop_reason != "completed" else "completed",
+        "stop_reason": stop_reason,
+        "completed_epoch": completed_epoch,
+        "global_step": global_step,
+        "global_micro_step": global_micro_step,
+        "global_examples": global_examples,
+        "best_loss": best_loss,
+        "best_loss_epoch": best_loss_epoch,
+        "best_primary_value": early_stopping.best,
+        "best_primary_epoch": early_stopping.best_epoch,
+        "best_primary_step": early_stopping.best_step,
+        "monitor": training_config.monitor,
+        "logging_failures": event_logger.failures,
+        "final_structured_metrics": last_structured_metrics,
+        "final_generation_diagnostics": last_generation_diagnostics,
+    }
+    atomic_json(output_dir / "run_summary.json", run_summary)
+    event_logger.log({"record_type": "run_end", **run_summary})
+
+
+def main() -> None:
+    try:
+        _run_training()
+    except Exception as exc:
+        args = parse_args()
+        output_dir = Path(args.output_dir)
+        failure = {
+            "status": "failed",
+            "exception_type": type(exc).__name__,
+            "message": str(exc),
+            "timestamp": time.time(),
+        }
+        try:
+            atomic_json(output_dir / "failure.json", failure)
+            JsonlLogger(output_dir / "training_log.jsonl").log(
+                {"record_type": "run_failure", **failure}
+            )
+        except OSError:
+            pass
+        raise
 
 
 if __name__ == "__main__":

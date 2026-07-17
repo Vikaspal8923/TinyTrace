@@ -168,6 +168,13 @@ Notes:
 - named optimizer groups separate compression, embeddings, LCEM, task heads, and MobileCLIP parameters
 - linear warmup, cosine decay, gradient clipping, AMP, validation-selected checkpoints, and early stopping are implemented
 - machine-readable training logs include per-task losses, target counts, learning rates, gradient norms, and throughput
+- canonical training profiles reject unknown fields and preserve all optimization/stability settings
+- training uses deterministic epoch-addressable ordering and validation never uses random frame fallback
+- gradient accumulation handles complete and partial windows and keeps scheduler steps optimizer-aligned
+- resumable checkpoints are versioned and include RNG, counters, selection state, run metadata, and bounded retention
+- validation artifacts include raw token IDs, parsed output, ground truth, termination metadata, and parser warnings
+- best-loss and best-primary-metric checkpoint roles are distinct and early stopping records its criterion and best step
+- the zero-dropout baseline remains stable; dropout 0.1 is an isolated experimental configuration
 - batched generation still requires independent per-sequence head-switching state
 
 ## Phase 3 — Tests Integrated With Development
