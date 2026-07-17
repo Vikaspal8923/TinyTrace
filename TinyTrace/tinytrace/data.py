@@ -139,6 +139,7 @@ class JsonTinyTraceDataset(Dataset):
         self.config = config
         self.frame_cache_dir = Path(frame_cache_dir) if frame_cache_dir else None
         self.allow_random_frames = allow_random_frames
+        self.max_retries_per_sample = 8
         self.text_tokenizer = CharTokenizer(config.text_vocab_size)
         self.time_tokenizer = NumericTokenizer(config.time_vocab, width=6)
         self.score_tokenizer = NumericTokenizer(config.score_vocab, width=3)
@@ -507,7 +508,29 @@ class JsonTinyTraceDataset(Dataset):
         return len(self.items)
 
     def __getitem__(self, index: int) -> dict:
-        return self._convert_sample(self.items[index])
+        if not self.items:
+            raise IndexError("TinyTrace dataset is empty.")
+        errors: list[str] = []
+        for offset in range(min(self.max_retries_per_sample, len(self.items))):
+            candidate_index = (index + offset) % len(self.items)
+            item = self.items[candidate_index]
+            try:
+                sample = self._convert_sample(item)
+            except Exception as exc:
+                video_path = item.get("video_path") or item.get("frames_path") or f"item[{candidate_index}]"
+                errors.append(f"{video_path}: {exc}")
+                continue
+            if offset > 0:
+                print(
+                    f"JsonTinyTraceDataset skipped invalid sample at index={index} "
+                    f"and used fallback index={candidate_index}."
+                )
+            return sample
+        joined = "; ".join(errors[:3])
+        raise RuntimeError(
+            "Unable to load a valid TinyTrace sample after retries. "
+            f"Recent errors: {joined}"
+        )
 
 
 def tinytrace_collate_fn(batch: list[dict]) -> dict:
