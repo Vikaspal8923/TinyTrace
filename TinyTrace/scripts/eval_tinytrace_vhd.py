@@ -142,6 +142,7 @@ def main() -> None:
             sample["frame_times"].unsqueeze(0).to(device),
             prompt_ids,
             max_new_tokens=config.max_generated_tokens,
+            task_mode=sample.get("task_mode", "highlight"),
         )
         predicted_events = decode_event_sequence(
             generated[0].tolist()[prompt_ids.size(1):],
@@ -149,6 +150,7 @@ def main() -> None:
             text_tokenizer,
             time_tokenizer,
             score_tokenizer,
+            task_mode=sample.get("task_mode", "highlight"),
         )
 
         pred_clip_scores = event_to_clip_scores(predicted_events, duration)

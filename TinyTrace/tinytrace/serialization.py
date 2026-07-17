@@ -14,6 +14,7 @@ class LabelType(IntEnum):
     SCORE = 3
     TIME_SYNC = 4
     SCORE_SYNC = 5
+    HIGHLIGHT_BOUNDARY = 6
 
 
 def caption_budget_metadata(
@@ -28,9 +29,9 @@ def caption_budget_metadata(
     for event_index, event in enumerate(events):
         if not isinstance(event, dict):
             raise ValueError(f"Event {event_index} must be an object.")
-        caption = event.get("caption")
+        caption = event.get("caption", "")
         if not isinstance(caption, str):
-            raise ValueError(f"Event {event_index} must contain a caption string.")
+            raise ValueError(f"Event {event_index} caption must be a string when provided.")
         original = len(text_tokenizer.encode(caption))
         retained = min(original, config.max_caption_tokens)
         details.append(
@@ -58,6 +59,7 @@ def serialize_example(
     text_tokenizer: CharTokenizer,
     time_tokenizer: NumericTokenizer,
     score_tokenizer: NumericTokenizer,
+    task_mode: str = "caption",
 ) -> tuple[list[int], list[int], int]:
     """Build the canonical instruction + causal event target sequence."""
     if not isinstance(events, list):
@@ -66,6 +68,8 @@ def serialize_example(
         raise ValueError(
             f"Received {len(events)} events, but max_events={config.max_events}."
         )
+    if task_mode not in {"caption", "highlight"}:
+        raise ValueError("task_mode must be either 'caption' or 'highlight'.")
     if not isinstance(instruction, str):
         raise ValueError("instruction must be a string.")
     instruction_ids = [config.bos_token_id]
@@ -81,14 +85,14 @@ def serialize_example(
             raise ValueError(f"Event {event_index} must be an object.")
         timestamps = event.get("timestamp")
         scores = event.get("score")
-        caption = event.get("caption")
+        caption = event.get("caption", "")
         if not isinstance(timestamps, list) or len(timestamps) != config.timestamp_value_count:
             raise ValueError(
                 f"Event {event_index} must contain {config.timestamp_value_count} timestamp values."
             )
         if not isinstance(scores, list) or len(scores) != config.score_value_count:
             raise ValueError(f"Event {event_index} must contain {config.score_value_count} score value.")
-        if not isinstance(caption, str) or not caption.strip():
+        if task_mode == "caption" and (not isinstance(caption, str) or not caption.strip()):
             raise ValueError(f"Event {event_index} must contain a non-empty caption.")
 
         time_ids = [
@@ -109,14 +113,21 @@ def serialize_example(
         )
         token_ids.extend(score_ids)
         label_types.extend(
-            LabelType.SCORE_SYNC if token_id == config.sync_token_id else LabelType.SCORE
+            (
+                LabelType.HIGHLIGHT_BOUNDARY
+                if task_mode == "highlight" and token_id == config.sync_token_id
+                else LabelType.SCORE_SYNC
+                if token_id == config.sync_token_id
+                else LabelType.SCORE
+            )
             for token_id in score_ids
         )
-        token_ids.extend(caption_ids)
-        label_types.extend(
-            LabelType.TEXT_SYNC if token_id == config.sync_token_id else LabelType.TEXT
-            for token_id in caption_ids
-        )
+        if task_mode == "caption":
+            token_ids.extend(caption_ids)
+            label_types.extend(
+                LabelType.TEXT_SYNC if token_id == config.sync_token_id else LabelType.TEXT
+                for token_id in caption_ids
+            )
 
     token_ids.append(config.eos_token_id)
     label_types.append(LabelType.TEXT)

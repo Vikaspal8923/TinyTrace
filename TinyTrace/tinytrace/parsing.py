@@ -16,7 +16,10 @@ def decode_event_sequence(
     score_tokenizer: NumericTokenizer,
     strict: bool = False,
     warnings: list[str] | None = None,
+    task_mode: str = "caption",
 ) -> list[dict]:
+    if task_mode not in {"caption", "highlight"}:
+        raise ValueError("task_mode must be either 'caption' or 'highlight'.")
     events: list[dict] = []
     mode = "time"
     time_ids: list[int] = []
@@ -36,7 +39,7 @@ def decode_event_sequence(
                 not malformed
                 and len(timestamps) == config.timestamp_value_count
                 and len(scores) == config.score_value_count
-                and bool(caption)
+                and (task_mode == "highlight" or bool(caption))
             )
         except (KeyError, ValueError, UnicodeError) as exc:
             if strict:
@@ -53,7 +56,10 @@ def decode_event_sequence(
                 "Generated event does not contain a complete timestamp, score, and caption."
             )
         if valid:
-            events.append({"timestamp": timestamps, "score": scores, "caption": caption})
+            event = {"timestamp": timestamps, "score": scores}
+            if task_mode == "caption":
+                event["caption"] = caption
+            events.append(event)
         time_ids = []
         score_ids = []
         caption_ids = []
@@ -78,7 +84,11 @@ def decode_event_sequence(
             if mode == "time":
                 mode = "score"
             elif mode == "score":
-                mode = "caption"
+                if task_mode == "highlight":
+                    flush_event()
+                    mode = "time"
+                else:
+                    mode = "caption"
             else:
                 flush_event()
                 mode = "time"

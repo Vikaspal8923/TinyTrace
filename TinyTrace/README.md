@@ -1,5 +1,25 @@
 # TinyTrace
 
+## QVHighlights Phase-A Training
+
+Phase A trains query-conditioned timestamp and saliency generation. Its
+annotations use `task_mode: "highlight"`: the query is included in the input
+instruction and captions are intentionally not supervised. The final Phase-A
+profile samples 32 frames per video.
+
+Rebuild the final dataset and run the corrected GPU profile from the repository
+root:
+
+```bash
+PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python TinyTrace/scripts/rebuild_final_qvhighlights_dataset.py
+PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python TinyTrace/scripts/train_final_qvh500.py
+```
+
+Outputs are written to `TinyTrace/outputs-qvh-phase-a-v1`. Select the Phase-A
+checkpoint using `qvh_mAP` and `qvh_HIT_at_1`, not caption accuracy. Caption
+training must later load this checkpoint and retain QVHighlights rehearsal
+batches to prevent timestamp/score forgetting.
+
 TinyTrace is a lightweight reimplementation of the TRACE causal event modeling idea for constrained environments. It keeps the TRACE event structure and generation order:
 
 - `time -> score -> caption`

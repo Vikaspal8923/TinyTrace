@@ -70,12 +70,14 @@ class SyntheticTinyTraceDataset(Dataset):
             events.append({"timestamp": [start, end], "score": [score], "caption": caption})
 
         instruction = "localize events and describe them"
-        token_ids, label_types, prompt_length = self._serialize_example(events, instruction)
+        task_mode = "caption"
+        token_ids, label_types, prompt_length = self._serialize_example(events, instruction, task_mode)
         return {
             "frames": frames,
             "frame_times": frame_times,
             "events": events,
             "instruction": instruction,
+            "task_mode": task_mode,
             "token_ids": torch.tensor(token_ids, dtype=torch.long),
             "label_types": torch.tensor(label_types, dtype=torch.long),
             "prompt_length": prompt_length,
@@ -109,7 +111,9 @@ class SyntheticTinyTraceDataset(Dataset):
                 frames[frame_index, :, stripe_start:stripe_end, :] = 1.0
         return frames
 
-    def _serialize_example(self, events: list[dict], instruction: str) -> tuple[list[int], list[int], int]:
+    def _serialize_example(
+        self, events: list[dict], instruction: str, task_mode: str = "caption"
+    ) -> tuple[list[int], list[int], int]:
         return serialize_example(
             events,
             instruction,
@@ -117,6 +121,7 @@ class SyntheticTinyTraceDataset(Dataset):
             self.text_tokenizer,
             self.time_tokenizer,
             self.score_tokenizer,
+            task_mode=task_mode,
         )
 
     def __len__(self) -> int:
@@ -336,7 +341,10 @@ class JsonTinyTraceDataset(Dataset):
 
         instruction = item.get("instruction", "localize events and describe them")
         events = item.get("events", [])
-        token_ids, label_types, prompt_length = self._serialize_example(events, instruction)
+        task_mode = item.get("task_mode", "caption")
+        token_ids, label_types, prompt_length = self._serialize_example(
+            events, instruction, task_mode
+        )
 
         return {
             "source_id": item.get("source_id"),
@@ -345,6 +353,7 @@ class JsonTinyTraceDataset(Dataset):
             "frame_times": frame_times_tensor,
             "events": events,
             "instruction": instruction,
+            "task_mode": task_mode,
             "token_ids": torch.tensor(token_ids, dtype=torch.long),
             "label_types": torch.tensor(label_types, dtype=torch.long),
             "prompt_length": prompt_length,
@@ -494,7 +503,9 @@ class JsonTinyTraceDataset(Dataset):
                 return frame
         raise ValueError(f"Could not decode frame near {timestamp:.3f}s from {video_path}")
 
-    def _serialize_example(self, events: list[dict], instruction: str) -> tuple[list[int], list[int], int]:
+    def _serialize_example(
+        self, events: list[dict], instruction: str, task_mode: str = "caption"
+    ) -> tuple[list[int], list[int], int]:
         return serialize_example(
             events,
             instruction,
@@ -502,6 +513,7 @@ class JsonTinyTraceDataset(Dataset):
             self.text_tokenizer,
             self.time_tokenizer,
             self.score_tokenizer,
+            task_mode=task_mode,
         )
 
     def __len__(self) -> int:
@@ -511,12 +523,15 @@ class JsonTinyTraceDataset(Dataset):
         if not self.items:
             raise IndexError("TinyTrace dataset is empty.")
         errors: list[str] = []
+        first_exception: Exception | None = None
         for offset in range(min(self.max_retries_per_sample, len(self.items))):
             candidate_index = (index + offset) % len(self.items)
             item = self.items[candidate_index]
             try:
                 sample = self._convert_sample(item)
             except Exception as exc:
+                if first_exception is None:
+                    first_exception = exc
                 video_path = item.get("video_path") or item.get("frames_path") or f"item[{candidate_index}]"
                 errors.append(f"{video_path}: {exc}")
                 continue
@@ -526,6 +541,8 @@ class JsonTinyTraceDataset(Dataset):
                     f"and used fallback index={candidate_index}."
                 )
             return sample
+        if len(self.items) == 1 and first_exception is not None:
+            raise first_exception
         joined = "; ".join(errors[:3])
         raise RuntimeError(
             "Unable to load a valid TinyTrace sample after retries. "
@@ -593,6 +610,7 @@ def tinytrace_collate_fn(batch: list[dict]) -> dict:
         "label_types": torch.stack(padded_types, dim=0),
         "events": [sample["events"] for sample in batch],
         "instruction": [sample["instruction"] for sample in batch],
+        "task_mode": [sample.get("task_mode", "caption") for sample in batch],
         "caption_budget": [
             sample.get(
                 "caption_budget",

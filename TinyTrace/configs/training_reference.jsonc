@@ -10,11 +10,17 @@
 {
   "reference_metadata": {
     "purpose": "single readable map of TinyTrace configuration",
-    "approved_reference": "frozen MobileCLIP-S0, 8 frames, 20 caption tokens",
+    "approved_reference": "caption baseline plus QVHighlights Phase-A profile",
     "model_source": "tinytrace/config.py:TinyTraceConfig",
     "training_source": "tinytrace/training.py:TrainingProfile",
     "existing_profiles_are_unchanged": true
   },
+
+  // QVHighlights Phase A uses query-conditioned time+score supervision.
+  // The executable tinytrace_qvhighlights_phase_a.json profile uses 32 frames,
+  // no caption target, up to 26 compressed saliency runs, and a dedicated
+  // stop/continue boundary head. Caption training starts from its best
+  // checkpoint and retains QVHighlights rehearsal batches.
 
   // Values below reproduce the approved model/representation baseline.
   "model": {

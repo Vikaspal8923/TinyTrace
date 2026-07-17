@@ -27,6 +27,8 @@ SUPPORTED_MONITORS = {
     "score_mae",
     "caption_exact_match",
     "event_count_mae",
+    "qvh_mAP",
+    "qvh_HIT_at_1",
 }
 MONITOR_DIRECTIONS = {
     "val_loss": "min",
@@ -37,6 +39,8 @@ MONITOR_DIRECTIONS = {
     "score_mae": "min",
     "caption_exact_match": "max",
     "event_count_mae": "min",
+    "qvh_mAP": "max",
+    "qvh_HIT_at_1": "max",
 }
 PARAMETER_GROUP_ORDER = (
     "compression",
@@ -250,7 +254,7 @@ def _parameter_category(name: str) -> str:
         return "embeddings"
     if name.startswith("blocks.") or name.startswith("final_norm."):
         return "lcem"
-    if name.startswith(("text_head.", "time_head.", "score_head.")):
+    if name.startswith(("text_head.", "time_head.", "score_head.", "boundary_head.")):
         return "task_heads"
     raise ValueError(f"Trainable parameter is not assigned to a known optimizer group: {name}")
 

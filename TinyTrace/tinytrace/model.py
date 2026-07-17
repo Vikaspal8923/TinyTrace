@@ -127,6 +127,7 @@ class TinyTraceOutput:
     text_logits: torch.Tensor
     time_logits: torch.Tensor
     score_logits: torch.Tensor
+    boundary_logits: torch.Tensor | None = None
     loss_components: dict[str, torch.Tensor] = field(default_factory=dict)
     weighted_loss_components: dict[str, torch.Tensor] = field(default_factory=dict)
     target_counts: dict[str, torch.Tensor] = field(default_factory=dict)
@@ -159,6 +160,7 @@ class TinyTraceModel(nn.Module):
         self.text_head = nn.Linear(config.d_model, config.text_vocab_size + 1)
         self.time_head = nn.Linear(config.d_model, len(config.time_vocab))
         self.score_head = nn.Linear(config.d_model, len(config.score_vocab))
+        self.boundary_head = nn.Linear(config.d_model, 2)
 
     def set_visual_encoder_trainable(self, trainable: bool, strategy: str = "full") -> None:
         self.visual_encoder.set_mobileclip_trainable(trainable, strategy=strategy)
@@ -340,8 +342,7 @@ class TinyTraceModel(nn.Module):
             # defensive parsing and diagnostics rather than crashing here.
             return time_ids
         if not values:
-            fallback = [0.0] * self.config.timestamp_value_count
-            return self._encode_numeric_values(fallback, mode="time")
+            return time_ids
         clipped = [min(max(value, 0.0), clip_end) for value in values]
         while len(clipped) < self.config.timestamp_value_count:
             clipped.append(clipped[-1] if clipped else 0.0)
@@ -402,6 +403,7 @@ class TinyTraceModel(nn.Module):
         text_logits = self.text_head(x)
         time_logits = self.time_head(x)
         score_logits = self.score_head(x)
+        boundary_logits = self.boundary_head(x)
 
         full_logits = torch.full(
             (x.size(0), x.size(1), self.config.total_token_vocab),
@@ -460,34 +462,28 @@ class TinyTraceModel(nn.Module):
                 )
                 target_counts["score"] = score_mask.sum().detach()
 
-            score_sync_mask = (target_types == 5) & valid_mask
+            score_sync_mask = ((target_types == 5) | (target_types == 6)) & valid_mask
             if score_sync_mask.any():
                 score_sync_targets = torch.zeros_like(target_tokens[score_sync_mask])
                 loss_components["score_sync"] = F.cross_entropy(hidden_score[score_sync_mask], score_sync_targets)
                 target_counts["score_sync"] = score_sync_mask.sum().detach()
 
-            # A caption <sync> is followed either by EOS (final event) or by
-            # the first timestamp token (another event). The task heads are
-            # otherwise trained independently, so this explicit boundary loss
-            # calibrates the cross-head decision used by generation.
+            # Boundary labels are attached to caption sync for caption tasks
+            # and score sync for highlight-only tasks. A dedicated binary head
+            # avoids comparing unrelated text/time logit scales.
             previous_types = label_types[:, :-1]
-            boundary_mask = (previous_types == 1) & valid_mask
+            boundary_mask = (
+                ((previous_types == 1) | (previous_types == 6)) & valid_mask
+            )
             if boundary_mask.any():
-                boundary_logits = torch.cat(
-                    [
-                        hidden_text[:, :, self.config.eos_token_id].unsqueeze(-1),
-                        hidden_time,
-                    ],
-                    dim=-1,
-                )
                 boundary_tokens = target_tokens[boundary_mask]
                 boundary_targets = torch.where(
                     boundary_tokens == self.config.eos_token_id,
                     torch.zeros_like(boundary_tokens),
-                    boundary_tokens - self.config.time_token_base + 1,
+                    torch.ones_like(boundary_tokens),
                 )
                 loss_components["boundary"] = F.cross_entropy(
-                    boundary_logits[boundary_mask],
+                    boundary_logits[:, prompt_len:-1][boundary_mask],
                     boundary_targets,
                 )
                 target_counts["boundary"] = boundary_mask.sum().detach()
@@ -500,6 +496,7 @@ class TinyTraceModel(nn.Module):
             text_logits=text_logits,
             time_logits=time_logits,
             score_logits=score_logits,
+            boundary_logits=boundary_logits,
             loss_components=loss_components,
             weighted_loss_components=weighted_loss_components,
             target_counts=target_counts,
@@ -515,7 +512,10 @@ class TinyTraceModel(nn.Module):
         frame_mask: torch.Tensor | None = None,
         visual_patch_features: torch.Tensor | None = None,
         return_metadata: bool = False,
+        task_mode: str = "caption",
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, object]]:
+        if task_mode not in {"caption", "highlight"}:
+            raise ValueError("task_mode must be either 'caption' or 'highlight'.")
         if prompt_ids.size(0) != 1:
             raise ValueError(
                 "TinyTrace generation currently supports batch size 1. "
@@ -554,24 +554,20 @@ class TinyTraceModel(nn.Module):
                         device=generated.device,
                     )
                 else:
-                    time_logits = output.time_logits[:, -1, :].clone()
-                    allowed = self._numeric_format_mask(
-                        time_logits.device,
-                        "time",
-                        position=0,
-                        vocab_size=time_logits.size(-1),
+                    boundary_choice = torch.argmax(
+                        output.boundary_logits[:, -1, :], dim=-1, keepdim=True
                     )
-                    time_logits[:, ~allowed] = float("-inf")
-                    best_time_logit, best_time_id = torch.max(time_logits, dim=-1, keepdim=True)
-                    eos_logit = output.text_logits[:, -1, self.config.eos_token_id].unsqueeze(-1)
-                    choose_eos = eos_logit >= best_time_logit
-                    next_token = best_time_id + self.config.time_token_base
-                    next_token = torch.where(
-                        choose_eos,
-                        torch.full_like(next_token, self.config.eos_token_id),
-                        next_token,
-                    )
-                    if not bool(choose_eos.item()):
+                    if int(boundary_choice.item()) == 0:
+                        next_token = torch.full_like(boundary_choice, self.config.eos_token_id)
+                    else:
+                        time_logits = output.time_logits[:, -1, :].clone()
+                        allowed = self._numeric_format_mask(
+                            time_logits.device, "time", position=0,
+                            vocab_size=time_logits.size(-1),
+                        )
+                        time_logits[:, ~allowed] = float("-inf")
+                        best_time_id = torch.argmax(time_logits, dim=-1, keepdim=True)
+                        next_token = best_time_id + self.config.time_token_base
                         mode = "time"
                         phase_token_count = 1
 
@@ -652,7 +648,11 @@ class TinyTraceModel(nn.Module):
                     )
                     mode = "score"
                 elif mode == "score":
-                    mode = "caption"
+                    if task_mode == "highlight":
+                        event_count += 1
+                        mode = "boundary"
+                    else:
+                        mode = "caption"
                 else:
                     event_count += 1
                     mode = "boundary"

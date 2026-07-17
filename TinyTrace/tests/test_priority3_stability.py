@@ -92,7 +92,12 @@ class Priority3StabilityTests(unittest.TestCase):
         path = Path(__file__).resolve().parents[1] / "configs" / "final_train_qvh500.json"
         profile = TrainingProfile.from_json(path)
 
-        self.assertEqual(profile.monitor, "val_loss")
+        self.assertEqual(profile.monitor, "qvh_mAP")
+        self.assertEqual(profile.monitor_mode, "max")
+        self.assertEqual(
+            profile.model_config,
+            "TinyTrace/configs/tinytrace_qvhighlights_phase_a.json",
+        )
         self.assertEqual(profile.checkpoint_keep, 3)
         self.assertFalse(profile.allow_random_frames)
 

@@ -111,6 +111,7 @@ def build_dataset(
             config=config,
             frame_cache_dir=frame_cache_dir,
             allow_random_frames=allow_random_frames,
+            validate_videos_on_init=True,
         )
     if synthetic_size is None:
         raise ValueError("A validation dataset path is required for real-data validation.")
@@ -466,6 +467,7 @@ def collect_predictions(
                 frame_mask=frame_mask,
                 visual_patch_features=patch_features,
                 return_metadata=True,
+                task_mode=sample.get("task_mode", "caption"),
             )
             raw_ids = generated[0, prompt_ids.size(1) :].tolist()
             parser_warnings: list[str] = []
@@ -476,12 +478,14 @@ def collect_predictions(
                 time_tokenizer,
                 score_tokenizer,
                 warnings=parser_warnings,
+                task_mode=sample.get("task_mode", "caption"),
             )
             predictions.append(
                 {
                     "sample_index": index,
                     "source_id": sample.get("source_id"),
                     "video_path": sample.get("video_path"),
+                    "task_mode": sample.get("task_mode", "caption"),
                     "checkpoint_identity": checkpoint_identity,
                     "ground_truth": sample["events"],
                     "ground_truth_caption_budget": sample.get("caption_budget"),

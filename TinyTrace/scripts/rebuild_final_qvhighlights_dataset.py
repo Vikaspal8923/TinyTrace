@@ -18,8 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=str, default="final_qvhighlights_tinytrace")
     parser.add_argument("--train-ratio", type=float, default=0.9)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--max-events", type=int, default=3)
-    parser.add_argument("--score-threshold", type=float, default=3.5)
+    parser.add_argument("--max-events", type=int, default=26)
     parser.add_argument("--link-mode", type=str, default="hardlink", choices=("hardlink", "copy"))
     return parser.parse_args()
 
@@ -35,46 +34,42 @@ def build_events(
     times: list[list[float]],
     scores: list[list[float]],
     max_events: int,
-    score_threshold: float,
-    caption: str,
 ) -> list[dict]:
     points = [(float(t[0]), float(s[0])) for t, s in zip(times, scores) if t and s]
-    segments = []
-    current = None
-
+    runs: list[dict] = []
     for time_value, score_value in points:
-        if score_value < score_threshold:
-            if current is not None:
-                segments.append(current)
-                current = None
-            continue
-
-        if current is None:
-            current = {"start": time_value, "end": time_value, "scores": [score_value]}
-        elif abs(time_value - current["end"]) <= 0.51:
-            current["end"] = time_value
-            current["scores"].append(score_value)
+        if not runs:
+            runs.append({"start": time_value, "end": time_value, "score": score_value, "points": 1})
+        elif abs(time_value - runs[-1]["end"]) <= 0.51 and score_value == runs[-1]["score"]:
+            runs[-1]["end"] = time_value
+            runs[-1]["points"] += 1
         else:
-            segments.append(current)
-            current = {"start": time_value, "end": time_value, "scores": [score_value]}
+            runs.append({"start": time_value, "end": time_value, "score": score_value, "points": 1})
 
-    if current is not None:
-        segments.append(current)
-
-    if not segments:
-        top_points = sorted(points, key=lambda pair: pair[1], reverse=True)[:max_events]
-        segments = [{"start": t, "end": t, "scores": [s]} for t, s in top_points]
-
-    segments = sorted(segments, key=lambda seg: (sum(seg["scores"]) / len(seg["scores"])), reverse=True)[:max_events]
-    segments = sorted(segments, key=lambda seg: seg["start"])
+    # Preserve the complete timeline under an edge-generation budget by
+    # repeatedly merging the least-different adjacent saliency runs.
+    while len(runs) > max_events:
+        merge_index = min(
+            range(len(runs) - 1),
+            key=lambda index: abs(runs[index]["score"] - runs[index + 1]["score"]),
+        )
+        left = runs[merge_index]
+        right = runs[merge_index + 1]
+        points = left["points"] + right["points"]
+        merged = {
+            "start": left["start"],
+            "end": right["end"],
+            "score": (left["score"] * left["points"] + right["score"] * right["points"]) / points,
+            "points": points,
+        }
+        runs[merge_index : merge_index + 2] = [merged]
 
     return [
         {
-            "timestamp": [round(seg["start"], 1), round(seg["end"], 1)],
-            "score": [round(sum(seg["scores"]) / len(seg["scores"]), 1)],
-            "caption": caption,
+            "timestamp": [round(run["start"], 1), round(run["end"], 1)],
+            "score": [round(run["score"], 1)],
         }
-        for seg in segments
+        for run in runs
     ]
 
 
@@ -198,11 +193,20 @@ def main() -> None:
         link_or_copy(source_path, target_path, args.link_mode)
 
         query = extract_query(item["conversations"][0]["value"])
-        events = build_events(item["times"], item["scores"], args.max_events, args.score_threshold, query)
+        events = build_events(item["times"], item["scores"], args.max_events)
+        source_runs = build_events(item["times"], item["scores"], max_events=max(len(item["times"]), 1))
         tinytrace_item = {
             "source_id": item["id"],
             "video_path": str(target_path.relative_to(output_tmp)),
-            "instruction": "localize highlight events and describe them",
+            "instruction": (
+                "Find the video highlights for this query and return their timestamps "
+                f"and saliency scores: {query}"
+            ),
+            "query": query,
+            "task_mode": "highlight",
+            "source_saliency_points": len(item["times"]),
+            "source_score_runs": len(source_runs),
+            "compressed_score_runs": len(events),
             "events": events,
         }
         raw_item = dict(item)
@@ -228,7 +232,6 @@ def main() -> None:
         "train_ratio": args.train_ratio,
         "seed": args.seed,
         "max_events": args.max_events,
-        "score_threshold": args.score_threshold,
         "link_mode": args.link_mode,
     }
     (annotations_dir / "download_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
