@@ -16,6 +16,41 @@ class LabelType(IntEnum):
     SCORE_SYNC = 5
 
 
+def caption_budget_metadata(
+    events: list[dict],
+    config: TinyTraceConfig,
+    text_tokenizer: CharTokenizer,
+) -> dict[str, object]:
+    """Make target caption truncation explicit without changing serialization."""
+    if not isinstance(events, list):
+        raise ValueError("events must be a list.")
+    details = []
+    for event_index, event in enumerate(events):
+        if not isinstance(event, dict):
+            raise ValueError(f"Event {event_index} must be an object.")
+        caption = event.get("caption")
+        if not isinstance(caption, str):
+            raise ValueError(f"Event {event_index} must contain a caption string.")
+        original = len(text_tokenizer.encode(caption))
+        retained = min(original, config.max_caption_tokens)
+        details.append(
+            {
+                "event_index": event_index,
+                "original_tokens": original,
+                "retained_tokens": retained,
+                "truncated": original > retained,
+            }
+        )
+    return {
+        "max_caption_tokens": config.max_caption_tokens,
+        "event_count": len(details),
+        "truncated_event_count": sum(bool(item["truncated"]) for item in details),
+        "original_caption_tokens": sum(int(item["original_tokens"]) for item in details),
+        "retained_caption_tokens": sum(int(item["retained_tokens"]) for item in details),
+        "events": details,
+    }
+
+
 def serialize_example(
     events: list[dict],
     instruction: str,

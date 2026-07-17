@@ -23,6 +23,7 @@ from tinytrace import (
     SyntheticTinyTraceDataset,
     TinyTraceConfig,
     TinyTraceModel,
+    aggregate_caption_budget,
     decode_event_sequence,
     evaluate_event_predictions,
     tinytrace_collate_fn,
@@ -177,6 +178,7 @@ def run_epoch(
     examples = 0
     frames_processed = 0
     tokens_processed = 0
+    caption_budget_reports: list[dict[str, object]] = []
     steps = 0
     total_steps = min(len(loader), max_steps_per_epoch) if max_steps_per_epoch > 0 else len(loader)
     epoch_started = time.perf_counter()
@@ -188,6 +190,7 @@ def run_epoch(
             if max_steps_per_epoch > 0 and step_index > max_steps_per_epoch:
                 break
             batch = move_batch(raw_batch, device)
+            caption_budget_reports.extend(raw_batch.get("caption_budget", []))
             examples += int(batch["frames"].size(0))
             frames_processed += int(batch["frame_mask"].sum().item())
             tokens_processed += int(batch["token_ids"].ne(model.config.pad_token_id).sum().item())
@@ -343,6 +346,7 @@ def run_epoch(
         "examples_per_second": examples / elapsed if elapsed > 0 else 0.0,
         "frames_per_second": frames_processed / elapsed if elapsed > 0 else 0.0,
         "tokens_per_second": tokens_processed / elapsed if elapsed > 0 else 0.0,
+        "caption_budget": aggregate_caption_budget(caption_budget_reports),
         "mean_gradient_norm": (
             gradient_norm_total / gradient_norm_steps if gradient_norm_steps else None
         ),
@@ -480,6 +484,7 @@ def collect_predictions(
                     "video_path": sample.get("video_path"),
                     "checkpoint_identity": checkpoint_identity,
                     "ground_truth": sample["events"],
+                    "ground_truth_caption_budget": sample.get("caption_budget"),
                     "raw_generated_token_ids": raw_ids,
                     "predicted": predicted,
                     "generation": generation_metadata,

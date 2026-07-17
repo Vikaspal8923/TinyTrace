@@ -443,13 +443,60 @@ This produces metrics similar in style to TRACE's QVHighlights evaluation:
 - `HL-min-VeryGood-mAP`
 - `HL-min-VeryGood-Hit1`
 
+## Priority 4 Representation Ablations
+
+Priority 4 keeps MobileCLIP-S0, the four-layer width-192 LCEM, tokenization,
+preprocessing, and optimizer policy fixed. It exposes two controlled experiment
+families:
+
+- frames: `8 -> 12 -> 16 -> 24 -> 32`
+- caption target tokens: `20`, `48`, and `64`
+
+The baseline configuration is not changed automatically. Frame comparisons are
+sequential, while 48- and 64-token caption candidates are each compared with
+the 20-token reference. Caption candidates change only the caption limit and
+the minimally required dependent generation budget.
+
+Analyze temporal spacing and caption truncation using existing annotations (no
+video acquisition is performed):
+
+```bash
+PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python \
+  TinyTrace/scripts/analyze_representation_profiles.py \
+  --dataset-json final_qvhighlights_tinytrace/annotations/tinytrace_val.json \
+  --output TinyTrace/outputs-representation/coverage.json
+```
+
+Create a dry-run manifest for the first sequential frame comparison:
+
+```bash
+PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python \
+  TinyTrace/scripts/run_representation_ablation.py \
+  --training-profile TinyTrace/configs/final_train_qvh500.json \
+  --kind frame --baseline-frames 8 \
+  --output-root TinyTrace/outputs-ablation-frame-08-12
+```
+
+Review the generated profiles and manifest, then add `--execute` to train the
+baseline and candidate in order and benchmark their end-to-end latency, stage
+latencies, inference memory, throughput, and feature diversity. Caption runs
+use `--kind caption --caption-candidate 48` (or `64`). Every completed run must
+contain `run_summary.json`, `history.json`, and
+`representation_benchmark.json` before it is eligible for a decision.
+
+Dataset samples, epoch metrics, and prediction artifacts now include explicit
+caption-target truncation metadata. Configuration validation bounds experiments
+to 32 frames, 64 caption tokens, and 512 generated tokens. These are safety
+limits, not recommendations to use the largest profile.
+
 ## Recommended Next Step
 
-If you want better TinyTrace results now, the best next step is:
+The next evidence-producing step is:
 
-1. download more valid matching QVHighlights clips
-2. regenerate `TinyTrace/data/qvh_tinytrace_subset.json`
-3. train for more epochs
-4. rerun `eval_tinytrace_vhd.py`
+1. run the no-acquisition representation analysis on the fixed validation split
+2. execute the 8-vs-12 frame ablation under the same training profile
+3. review quality, latency, throughput, and memory together
+4. retain 8 frames unless 12 passes predefined tradeoff guardrails
 
-That will help much more than changing the metric.
+Do not jump to 16, 24, or 32 frames until the preceding ladder comparison is
+accepted.

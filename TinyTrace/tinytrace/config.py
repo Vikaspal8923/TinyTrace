@@ -1,13 +1,16 @@
 import json
 import math
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 
 @dataclass
 class TinyTraceConfig:
+    MAX_SUPPORTED_FRAMES: ClassVar[int] = 32
+    MAX_SUPPORTED_CAPTION_TOKENS: ClassVar[int] = 64
+    MAX_SUPPORTED_GENERATED_TOKENS: ClassVar[int] = 512
     image_size: int = 256
     max_frames: int = 8
     visual_hidden_dim: int = 1024
@@ -116,6 +119,20 @@ class TinyTraceConfig:
             raise ValueError("dropout must be in [0, 1).")
         if self.min_caption_tokens > self.max_caption_tokens:
             raise ValueError("min_caption_tokens cannot exceed max_caption_tokens.")
+        if self.max_frames > self.MAX_SUPPORTED_FRAMES:
+            raise ValueError(
+                f"max_frames exceeds the declared safety limit of {self.MAX_SUPPORTED_FRAMES}."
+            )
+        if self.max_caption_tokens > self.MAX_SUPPORTED_CAPTION_TOKENS:
+            raise ValueError(
+                "max_caption_tokens exceeds the declared safety limit of "
+                f"{self.MAX_SUPPORTED_CAPTION_TOKENS}."
+            )
+        if self.max_generated_tokens > self.MAX_SUPPORTED_GENERATED_TOKENS:
+            raise ValueError(
+                "max_generated_tokens exceeds the declared safety limit of "
+                f"{self.MAX_SUPPORTED_GENERATED_TOKENS}."
+            )
         for name in (
             "time_loss_weight",
             "score_loss_weight",
@@ -265,7 +282,9 @@ class TinyTraceConfig:
     def from_dict(cls, values: dict[str, Any]) -> "TinyTraceConfig":
         if not isinstance(values, dict):
             raise ValueError("TinyTrace configuration payload must be an object.")
-        known_fields = cls.__dataclass_fields__
+        # dataclasses.fields excludes ClassVar safety constants, so JSON cannot
+        # override executable limits as though they were model parameters.
+        known_fields = {config_field.name for config_field in fields(cls)}
         unknown = sorted(set(values) - set(known_fields))
         if unknown:
             raise ValueError(f"Unknown TinyTrace config fields: {', '.join(unknown)}")

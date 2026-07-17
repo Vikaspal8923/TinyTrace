@@ -13,7 +13,7 @@ import torch
 from torch.utils.data import Dataset
 
 from .config import TinyTraceConfig
-from .serialization import serialize_example
+from .serialization import caption_budget_metadata, serialize_example
 from .tokenizers import CharTokenizer, NumericTokenizer
 
 
@@ -79,6 +79,7 @@ class SyntheticTinyTraceDataset(Dataset):
             "token_ids": torch.tensor(token_ids, dtype=torch.long),
             "label_types": torch.tensor(label_types, dtype=torch.long),
             "prompt_length": prompt_length,
+            "caption_budget": caption_budget_metadata(events, self.config, self.text_tokenizer),
         }
 
     def _make_structured_frames(self, index: int, num_frames: int) -> torch.Tensor:
@@ -346,6 +347,7 @@ class JsonTinyTraceDataset(Dataset):
             "token_ids": torch.tensor(token_ids, dtype=torch.long),
             "label_types": torch.tensor(label_types, dtype=torch.long),
             "prompt_length": prompt_length,
+            "caption_budget": caption_budget_metadata(events, self.config, self.text_tokenizer),
         }
 
     def _load_video_frames_cached(
@@ -568,4 +570,19 @@ def tinytrace_collate_fn(batch: list[dict]) -> dict:
         "label_types": torch.stack(padded_types, dim=0),
         "events": [sample["events"] for sample in batch],
         "instruction": [sample["instruction"] for sample in batch],
+        "caption_budget": [
+            sample.get(
+                "caption_budget",
+                {
+                    "available": False,
+                    "max_caption_tokens": None,
+                    "event_count": 0,
+                    "truncated_event_count": 0,
+                    "original_caption_tokens": 0,
+                    "retained_caption_tokens": 0,
+                    "events": [],
+                },
+            )
+            for sample in batch
+        ],
     }

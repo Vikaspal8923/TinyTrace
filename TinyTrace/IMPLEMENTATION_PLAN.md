@@ -406,3 +406,28 @@ The current codebase is useful because:
 - it provides a stable base for the next architecture-faithful implementation steps
 
 But before serious BTP experiments and before publication claims, MobileCLIP integration and architecture tightening are mandatory.
+
+## Priority 4 — Representation Improvements
+
+### Implementation status
+
+- `implemented`: named 8/12/16/24/32 frame configurations
+- `implemented`: named 20/48/64 caption-budget configurations
+- `implemented`: explicit frame, caption, and generation safety limits
+- `implemented`: deterministic temporal-coverage analysis without acquisition
+- `implemented`: per-sample caption truncation metadata and aggregate logging
+- `implemented`: patch-summary and compressed-slot diversity diagnostics
+- `implemented`: trained-checkpoint latency, throughput, and GPU-memory benchmark
+- `implemented`: single-variable ablation validation and sequential execution
+- `implemented`: comprehensive Priority 4 tests
+- `pending evidence`: execute real controlled runs and select a default from measured tradeoffs
+
+### Decision rule
+
+The code does not promote a candidate automatically. A comparison is incomplete
+until quality metrics, training measurements, and inference benchmark artifacts
+exist for both baseline and candidate. Frame experiments advance one rung at a
+time; caption 48 and 64 are independent candidates against the 20-token
+reference. MobileCLIP, LCEM capacity, tokenizer, preprocessing, split, seed,
+optimizer, effective batch size, training duration, and checkpoint-selection
+policy remain fixed.
